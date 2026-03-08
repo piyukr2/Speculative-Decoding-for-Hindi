@@ -1,0 +1,32 @@
+# Default configuration for EESD Hindi experiments
+# Override any field via CLI flags (e.g. --batch_size 16)
+
+model:
+  name: "Qwen/Qwen2-1.5B"        # Base LLM (~1.5B params; swap for any causal LM)
+  exit_depths: [8, 16, 22]         # Transformer layer indices for exit heads
+  draft_depth: 8                   # Default draft depth (shallowest = fastest)
+  torch_dtype: "float16"           # Use bfloat16 on Ampere+ GPUs
+
+training:
+  max_samples: 167000              # ~5M tokens from AI4Bharat (30 tok/sent avg)
+  batch_size: 2                    # 2 for Kaggle T4 (15 GB); use grad accum for effective 8
+  epochs: 3
+  lr: 1.0e-4
+  weight_decay: 0.01
+  max_length: 256
+  warmup_ratio: 0.1
+  log_every: 100
+  num_workers: 2                   # Kaggle/Colab have 4 CPU cores; 2 workers is ideal
+  gradient_accumulation_steps: 4   # effective batch = 2 × 4 = 8
+  output_dir: "results/checkpoints"
+  cache_dir: null                  # Set to a local path to avoid re-downloading
+
+inference:
+  K: 5                             # Draft length (tokens per speculative step)
+  temperature: 1.0                 # 0.0 = greedy; >0 = sampling
+  max_new_tokens: 100
+
+evaluation:
+  max_eval_samples: 1000           # XL-Sum Hindi test samples
+  max_new_tokens: 100              # Longer generation = better speedup measurement
+  output_dir: "results"

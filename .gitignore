@@ -1,0 +1,65 @@
+# Virtual environments
+venv/
+.venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Model checkpoints (large binary files)
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Training outputs & results
+outputs_training_checkpoints/
+results/
+results_after_epoch_*/
+results_final/
+sanity_check_output/
+
+# Logs
+*.log
+log.txt
+loss.txt
+src/error_log.txt
+
+# HuggingFace cache
+.cache/
+*.cache
+cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.synctex.gz
+missfont.log
+
+# Archives
+*.zip
+
+# Kaggle
+.kaggle/
+KAGGLE_API_TOKEN
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
