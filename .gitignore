@@ -168,6 +168,9 @@ __marimo__/
 # Project-specific: EESD Hindi
 # =============================================================
 
+# Ignore the whole EESD dataset/code drop
+EESD/
+
 # Agent plan (internal use only)
 AGENT_PLAN.md
 

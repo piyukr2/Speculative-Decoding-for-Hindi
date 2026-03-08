@@ -12,11 +12,12 @@ An empirical study of Early-Exit Speculative Decoding (EESD) on morphologically 
 2. [Project Structure](#project-structure)
 3. [Setup](#setup)
 4. [Datasets](#datasets)
-5. [Training](#training)
-6. [Inference](#inference)
-7. [Evaluation](#evaluation)
-8. [Results & Analysis](#results--analysis)
-9. [References](#references)
+5. [Models](#models)
+6. [Training](#training)
+7. [Inference](#inference)
+8. [Evaluation](#evaluation)
+9. [Results & Analysis](#results--analysis)
+10. [References](#references)
 
 ---
 
@@ -112,6 +113,14 @@ python -c "import torch, transformers; print('torch:', torch.__version__, '| CUD
 | XL-Sum Hindi | Formal evaluation | 500 test samples | `csebuetnlp/xlsum` / config `hindi` |
 
 Both datasets are downloaded automatically on first use.
+
+---
+
+## Models
+
+Pretrained model artifacts (EESD exit-head checkpoints) are available on Hugging Face:
+
+- https://huggingface.co/piyukr/EESD
 
 ---
 
