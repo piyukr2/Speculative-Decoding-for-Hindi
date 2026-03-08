@@ -1,0 +1,27 @@
+ Testing exit depth 8 …
+    Depth 8: α=0.531, speedup=0.26x, EESD=10.38s, AR=2.69s
+
+  Testing exit depth 16 …
+    Depth 16: α=0.548, speedup=0.26x, EESD=10.17s, AR=2.69s
+
+  Testing exit depth 22 …
+    Depth 22: α=0.610, speedup=0.29x, EESD=9.25s, AR=2.69s
+
+Using depth 22 (best α) for morphological analysis.
+
+[Morphological Analysis] Running …
+  other          : α=0.533  (160/300)
+
+Results saved → results/evaluation_results.json
+
+============================================================
+SUMMARY
+============================================================
+
+Depth Analysis:
+  Depth  8: α=0.531, speedup=0.26x
+  Depth 16: α=0.548, speedup=0.26x
+  Depth 22: α=0.610, speedup=0.29x
+
+Morphological Analysis:
+  other          : α=0.533
