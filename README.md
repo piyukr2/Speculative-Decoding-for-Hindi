@@ -2,6 +2,8 @@
 
 An empirical study of Early-Exit Speculative Decoding (EESD) on morphologically rich Hindi text generation. This project implements the framework of [Liu et al. (2024)](https://aclanthology.org/2024.findings-acl.195/) adapted for Hindi using the AI4Bharat IndicCorpv2 training corpus and XL-Sum Hindi evaluation set.
 
+🔗 **GitHub**: [https://github.com/piyukr2/Speculative-Decoding-for-Hindi](https://github.com/piyukr2/Speculative-Decoding-for-Hindi)
+
 ---
 
 ## Table of Contents
