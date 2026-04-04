@@ -328,12 +328,13 @@ def train(args: argparse.Namespace):
             desc=f"Epoch {epoch}/{args.epochs}",
             unit="step",
             dynamic_ncols=True,
+            disable=not args.tqdm,
         )
         for step, batch in pbar:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             if step == 1:
-                print("First batch loaded, running forward pass …")
+                print("First batch loaded, running forward pass …", flush=True)
 
             amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_bf16):
@@ -367,14 +368,28 @@ def train(args: argparse.Namespace):
                 epoch_depth_losses[d] += dl
             global_step += 1
 
-            # Update progress bar postfix (per-depth running averages + loss)
+            # Progress reporting
             current_lr = scheduler.get_last_lr()[0]
             avg_loss_so_far = epoch_loss / step
-            postfix = {"loss": f"{avg_loss_so_far:.4f}"}
-            postfix.update({f"d{d}": f"{epoch_depth_losses[d]/step:.3f}"
-                       for d in sorted(epoch_depth_losses, key=int)})
-            postfix["lr"] = f"{current_lr:.2e}"
-            pbar.set_postfix(postfix)
+            if args.tqdm:
+                postfix = {"loss": f"{avg_loss_so_far:.4f}"}
+                postfix.update({f"d{d}": f"{epoch_depth_losses[d]/step:.3f}"
+                           for d in sorted(epoch_depth_losses, key=int)})
+                postfix["lr"] = f"{current_lr:.2e}"
+                pbar.set_postfix(postfix)
+            else:
+                if step % 1000 == 0 or step == len(train_loader):
+                    depth_str = "  ".join(
+                        f"d{d}={epoch_depth_losses[d]/step:.3f}"
+                        for d in sorted(epoch_depth_losses, key=int)
+                    )
+                    pct = step / len(train_loader) * 100
+                    print(
+                        f"  Epoch {epoch}/{args.epochs}  "
+                        f"[{step}/{len(train_loader)} {pct:.0f}%]  "
+                        f"loss={avg_loss_so_far:.4f}  {depth_str}  lr={current_lr:.2e}",
+                        flush=True,
+                    )
 
         # Compute validation loss
         model.exit_heads.eval()
@@ -469,7 +484,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_samples", type=int, default=167_000,
                    help="Max training samples (~5M tokens at ~30 tok/sent)")
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--log_every", type=int, default=100)
+    p.add_argument("--tqdm", action="store_true",
+                   help="Show tqdm progress bar (default: print every 1000 batches)")
     p.add_argument("--output_dir", default="results/checkpoints")
     p.add_argument("--cache_dir", default=None,
                    help="HuggingFace datasets cache directory")

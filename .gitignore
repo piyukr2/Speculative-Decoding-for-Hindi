@@ -169,10 +169,10 @@ __marimo__/
 # =============================================================
 
 # Ignore the whole EESD dataset/code drop
-EESD/
+./EESD/*
 
 # Agent plan (internal use only)
-AGENT_PLAN.md
+AGENT_PLAN*.md
 
 # Model checkpoints (large binary files)
 *.pt
@@ -220,3 +220,36 @@ KAGGLE_API_TOKEN
 # IDE
 .vscode/
 .idea/
+
+
+_archive/
+
+EESD_plan_ahead/
+
+
+Recent_paper_on_Speculative_decoding/
+
+.claude/
+
+.kaggle/
+
+acl.sty
+
+overfit_test.py
+
+professor_meeting_prep.tex
+
+deep_verify.sh              
+DIAGNOSIS.md                
+report.tex
+directory_structure.txt     
+requirements.txt
+Speculative_decoding_recent_paper.pdf
+EESD.pdf
+EESD_plan_ahead
+kaggle_train_bottleneck.py  
+verify_prompts_0_to_7.sh
+kaggle_train.py             
+viva_preparation.tex
+*checkpoints/*
+CLAUDE_CODE_PROMPTS.md

@@ -1,0 +1,17 @@
+{
+  "completed_epoch": 3,
+  "train_loss": 0.6984908484124138,
+  "train_depth_losses": {
+    "8": 0.7940982083788889,
+    "16": 0.7885422356207213,
+    "22": 0.5128320415371549
+  },
+  "val_loss": 0.6911642146110535,
+  "val_depth_losses": {
+    "8": 0.7842352950572967,
+    "16": 0.7824528980255127,
+    "22": 0.5068043559789658
+  },
+  "global_step": 167000,
+  "checkpoint": "/content/drive/MyDrive/EESD_project/results/checkpoints/exit_heads_epoch3.pt"
+}

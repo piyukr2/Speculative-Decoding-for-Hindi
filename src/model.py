@@ -30,6 +30,27 @@ class ExitHead(nn.Module):
         return self.lm_head(self.norm(hidden_states))
 
 
+class BottleneckExitHead(nn.Module):
+    """Compact exit head: LayerNorm → Linear(hidden→256) → GELU → Linear(256→vocab). ~39M params."""
+
+    def __init__(self, hidden_size: int, vocab_size: int, bottleneck_dim: int = 256):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size)
+        self.down_proj = nn.Linear(hidden_size, bottleneck_dim)
+        self.act = nn.GELU()
+        self.up_proj = nn.Linear(bottleneck_dim, vocab_size, bias=False)
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"BottleneckExitHead: {total_params / 1e6:.1f}M params "
+              f"({hidden_size}→{bottleneck_dim}→{vocab_size})")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.to(self.norm.weight)  # match device AND dtype
+        x = self.norm(hidden_states)
+        x = self.down_proj(x)
+        x = self.act(x)
+        return self.up_proj(x)
+
+
 class EarlyExitLM(nn.Module):
     """
     Wraps a causal LM with early-exit heads at specified layer depths.
@@ -62,13 +83,7 @@ class EarlyExitLM(nn.Module):
         if load_in_8bit:
             load_kwargs["load_in_8bit"] = True
         else:
-            # Newer transformers (>=4.45) renamed torch_dtype → dtype
-            import transformers
-            _ver = tuple(int(x) for x in transformers.__version__.split(".")[:2])
-            if _ver >= (4, 45):
-                load_kwargs["dtype"] = torch.float16
-            else:
-                load_kwargs["torch_dtype"] = torch.float16
+            load_kwargs["torch_dtype"] = torch.float16
             
         self.base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
@@ -118,6 +133,102 @@ class EarlyExitLM(nn.Module):
             if obj is not None:
                 return obj
         raise RuntimeError("Cannot locate embedding layer.")
+
+    # ------------------------------------------------------------------
+    # True early-exit forward (used during inference drafting)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def partial_forward(
+        self,
+        input_ids: torch.Tensor,
+        depth: int,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[tuple] = None,
+    ):
+        """Run only the first `depth` layers of the base model, then apply exit head.
+
+        Returns (logits, new_past_key_values).
+        Does NOT run layers depth..L-1.
+
+        Args:
+            input_ids: [B, T] token ids (or [B, 1] when using KV cache).
+            depth: number of transformer layers to run (1-indexed, runs layers 0..depth-1).
+            position_ids: [B, T] position indices. Auto-computed from cache length if None.
+            past_key_values: tuple of (key, value) tensors from a previous partial_forward call.
+
+        Returns:
+            logits: [B, T, V] exit-head logits after layer `depth`.
+            new_past_key_values: tuple of (key, value) for layers 0..depth-1.
+        """
+        layers = self._get_transformer_layers()
+        embed_tokens = self._get_embed_tokens()
+
+        # --- Embedding ---
+        hidden_states = embed_tokens(input_ids)
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        batch_size, seq_len = input_ids.shape
+
+        # --- Position IDs ---
+        if position_ids is None:
+            if past_key_values is not None and len(past_key_values) > 0:
+                # past_key_values[layer_idx] = (key, value), key shape: [B, num_heads, S, head_dim]
+                past_len = past_key_values[0][0].shape[2]
+            else:
+                past_len = 0
+            position_ids = torch.arange(
+                past_len, past_len + seq_len, device=device
+            ).unsqueeze(0).expand(batch_size, -1)
+
+        # --- Causal attention mask ---
+        # Try the model's own mask builder first; fall back to None (let layers handle it)
+        causal_mask = None
+        try:
+            base_inner = getattr(self.base_model, "model", None)
+            if base_inner is not None and hasattr(base_inner, "_update_causal_mask"):
+                total_len = (past_key_values[0][0].shape[2] if past_key_values else 0) + seq_len
+                causal_mask = base_inner._update_causal_mask(
+                    None, hidden_states, torch.arange(total_len, device=device),
+                    past_key_values=None,
+                )
+        except Exception:
+            causal_mask = None
+
+        # --- Run layers 0..depth-1 ---
+        new_past_key_values = []
+        for i in range(depth):
+            layer = layers[i]
+            past_kv = past_key_values[i] if past_key_values is not None and i < len(past_key_values) else None
+
+            layer_kwargs = {
+                "hidden_states": hidden_states.to(layer.self_attn.q_proj.weight.device),
+                "position_ids": position_ids.to(layer.self_attn.q_proj.weight.device),
+                "use_cache": True,
+            }
+
+            # Pass attention mask if we have one
+            if causal_mask is not None:
+                layer_kwargs["attention_mask"] = causal_mask.to(layer.self_attn.q_proj.weight.device)
+
+            # Pass past KV cache for this layer
+            if past_kv is not None:
+                layer_kwargs["past_key_value"] = past_kv
+
+            layer_out = layer(**layer_kwargs)
+
+            # layer_out is (hidden_states, present_kv, ...) or (hidden_states, ...)
+            hidden_states = layer_out[0]
+            if len(layer_out) > 1 and layer_out[1] is not None:
+                new_past_key_values.append(layer_out[1])
+            else:
+                new_past_key_values.append(None)
+
+        # --- Apply exit head ---
+        hidden_states = hidden_states.to(device)
+        logits = self.exit_heads[str(depth)](hidden_states)  # [B, T, V]
+
+        return logits, tuple(new_past_key_values)
 
     # ------------------------------------------------------------------
     # Forward pass (used during training)
@@ -277,6 +388,32 @@ class EarlyExitLM(nn.Module):
         torch.save(self.exit_heads.state_dict(), path)
 
     def load_exit_heads(self, path: str):
-        state = torch.load(path, map_location="cpu")
+        state = torch.load(path, map_location="cpu", weights_only=True)
         self.exit_heads.load_state_dict(state)
         self.exit_heads.to(next(self.base_model.parameters()).device)
+
+
+class ThompsonSamplingController:
+    """Dynamically selects exit depth using Thompson Sampling (Beta-Bernoulli bandit)."""
+
+    def __init__(self, exit_depths: List[int], total_layers: int = 28):
+        self.depths = list(exit_depths)
+        self.total_layers = total_layers
+        self.alpha = {d: 1.0 for d in self.depths}  # Beta prior successes
+        self.beta = {d: 1.0 for d in self.depths}   # Beta prior failures
+
+    def select_depth(self) -> int:
+        import random
+        best_depth = self.depths[0]
+        best_score = -1.0
+        for d in self.depths:
+            theta = random.betavariate(self.alpha[d], self.beta[d])
+            score = theta * (self.total_layers / d)  # acceptance_rate × speedup_factor
+            if score > best_score:
+                best_score = score
+                best_depth = d
+        return best_depth
+
+    def update(self, depth: int, num_accepted: int, num_drafted: int):
+        self.alpha[depth] += num_accepted
+        self.beta[depth] += (num_drafted - num_accepted)
