@@ -186,6 +186,7 @@ results/
 results_after_epoch_*/
 results_final/
 sanity_check_output/
+Outputs_after_misem_upto_epoch_6/
 
 # Logs & loss history
 log.txt
@@ -254,3 +255,6 @@ viva_preparation.tex
 *checkpoints/*
 CLAUDE_CODE_PROMPTS.md
 /EESD/
+Outputs_after_misem_upto_epoch_6/
+project_explaination.pdf
+project_explaination.tex
