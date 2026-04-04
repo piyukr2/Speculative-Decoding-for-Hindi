@@ -169,7 +169,7 @@ __marimo__/
 # =============================================================
 
 # Ignore the whole EESD dataset/code drop
-./EESD/*
+/EESD/
 
 # Agent plan (internal use only)
 AGENT_PLAN*.md
@@ -196,8 +196,8 @@ src/error_log.txt
 cache/
 *.cache
 
-# Jupyter notebooks (large outputs)
-*.ipynb
+
+/notebooks/
 
 # LaTeX build artifacts
 *.aux
@@ -253,3 +253,4 @@ kaggle_train.py
 viva_preparation.tex
 *checkpoints/*
 CLAUDE_CODE_PROMPTS.md
+/EESD/

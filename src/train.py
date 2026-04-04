@@ -48,18 +48,28 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-from src.model import EarlyExitLM
+from src.model import EarlyExitLM, BottleneckExitHead
 from src.data import get_train_dataloader
 
 
 # ---------------------------------------------------------------------------
 # Quick acceptance-rate probe (runs a few samples through draft → verify)
 # ---------------------------------------------------------------------------
+
+def _replace_exit_heads_with_bottleneck(model: EarlyExitLM) -> None:
+    """Replace the default ExitHead modules with BottleneckExitHead."""
+    hidden_size = model.base_model.config.hidden_size
+    vocab_size = model.base_model.config.vocab_size
+    model.exit_heads = nn.ModuleDict(
+        {str(d): BottleneckExitHead(hidden_size, vocab_size) for d in model.exit_depths}
+    )
+
 
 @torch.no_grad()
 def _probe_acceptance_rate(
@@ -237,12 +247,13 @@ def train(args: argparse.Namespace):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Model
+    # Model — create with default ExitHead, then swap in BottleneckExitHead
     model = EarlyExitLM(
         model_name_or_path=args.model_name,
         exit_depths=args.exit_depths,
         load_in_8bit=getattr(args, 'load_in_8bit', False),
     )
+    _replace_exit_heads_with_bottleneck(model)
     # Move exit heads to device (base model already placed via device_map="auto")
     model.exit_heads = model.exit_heads.to(device)
 
