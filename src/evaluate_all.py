@@ -124,13 +124,17 @@ def run_draft_model(prompts, tokenizer, args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    alpha = round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0
     return {
         "method": "draft_model",
-        "alpha": round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "alpha": alpha,
         "time_sec": round(elapsed, 2),
         "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
         "total_tokens": total_tokens,
         "vram_mb": round(vram_mb, 1),
+        "per_depth_alpha": {"separate_model": alpha},
+        "per_depth_accepted": {"separate_model": total_accepted},
+        "per_depth_drafted": {"separate_model": total_drafted},
     }
 
 
@@ -143,30 +147,55 @@ def run_eesd_heavy_hook(prompts, model, tokenizer, args):
     model.load_exit_heads("EESD/exit_heads_final.pt")
     model.eval()
 
-    total_tokens = 0
-    total_accepted = 0
-    total_drafted = 0
-    t0 = time.time()
+    original_draft_depth = model.draft_depth
+    per_depth_accepted = {}
+    per_depth_drafted = {}
+    per_depth_alpha = {}
+    per_depth_time = {}
+    per_depth_tokens = {}
 
-    for prompt_text, input_ids in prompts:
-        text, n_draft, n_accepted, wall = eesd_generate(
-            model, tokenizer, prompt_text,
-            K=args.K, max_new_tokens=args.max_new_tokens, temperature=0.0,
-        )
-        total_drafted += n_draft
-        total_accepted += n_accepted
-        total_tokens += len(tokenizer.encode(text))
+    for depth in model.exit_depths:
+        model.draft_depth = depth
+        d_tokens = 0
+        d_accepted = 0
+        d_drafted = 0
+        t0 = time.time()
+        for prompt_text, input_ids in prompts:
+            text, n_draft, n_accepted, wall = eesd_generate(
+                model, tokenizer, prompt_text,
+                K=args.K, max_new_tokens=args.max_new_tokens, temperature=0.0,
+            )
+            d_drafted += n_draft
+            d_accepted += n_accepted
+            d_tokens += len(tokenizer.encode(text))
+        elapsed_d = time.time() - t0
+        per_depth_accepted[depth] = d_accepted
+        per_depth_drafted[depth] = d_drafted
+        per_depth_alpha[depth] = round(d_accepted / d_drafted, 4) if d_drafted > 0 else 0.0
+        per_depth_time[depth] = round(elapsed_d, 2)
+        per_depth_tokens[depth] = d_tokens
 
-    elapsed = time.time() - t0
+    model.draft_depth = original_draft_depth
     vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    # Use the original draft_depth as the "primary" result
+    primary = original_draft_depth
+    total_accepted = per_depth_accepted[primary]
+    total_drafted = per_depth_drafted[primary]
+    total_tokens = per_depth_tokens[primary]
+    elapsed = per_depth_time[primary]
 
     return {
         "method": "eesd_heavy_hook",
         "alpha": round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0,
-        "time_sec": round(elapsed, 2),
+        "time_sec": elapsed,
         "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
         "total_tokens": total_tokens,
         "vram_mb": round(vram_mb, 1),
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_time": per_depth_time,
     }
 
 
@@ -179,39 +208,65 @@ def run_eesd_heavy_true_exit(prompts, model, tokenizer, args):
     model.load_exit_heads("EESD/exit_heads_final.pt")
     model.eval()
 
-    total_tokens = 0
-    total_accepted = 0
-    total_drafted = 0
-    draft_time = 0.0
-    verify_time = 0.0
-    overhead_time = 0.0
-    t0 = time.time()
+    per_depth_accepted = {}
+    per_depth_drafted = {}
+    per_depth_alpha = {}
+    per_depth_time = {}
+    per_depth_tokens = {}
+    per_depth_draft_time = {}
+    per_depth_verify_time = {}
+    per_depth_overhead_time = {}
 
-    for prompt_text, input_ids in prompts:
-        text, stats = eesd_generate_true_exit(
-            model, tokenizer, prompt_text,
-            max_new_tokens=args.max_new_tokens, K=args.K, exit_depth=22,
-        )
-        total_drafted += stats["total_drafted"]
-        total_accepted += stats["total_accepted"]
-        total_tokens += stats["new_tokens"]
-        draft_time += stats["draft_time"]
-        verify_time += stats["verify_time"]
-        overhead_time += stats["overhead_time"]
+    for depth in model.exit_depths:
+        d_tokens = 0
+        d_accepted = 0
+        d_drafted = 0
+        d_draft_time = 0.0
+        d_verify_time = 0.0
+        d_overhead_time = 0.0
+        t0 = time.time()
+        for prompt_text, input_ids in prompts:
+            text, stats = eesd_generate_true_exit(
+                model, tokenizer, prompt_text,
+                max_new_tokens=args.max_new_tokens, K=args.K, exit_depth=depth,
+            )
+            d_drafted += stats["total_drafted"]
+            d_accepted += stats["total_accepted"]
+            d_tokens += stats["new_tokens"]
+            d_draft_time += stats["draft_time"]
+            d_verify_time += stats["verify_time"]
+            d_overhead_time += stats["overhead_time"]
+        elapsed_d = time.time() - t0
+        per_depth_accepted[depth] = d_accepted
+        per_depth_drafted[depth] = d_drafted
+        per_depth_alpha[depth] = round(d_accepted / d_drafted, 4) if d_drafted > 0 else 0.0
+        per_depth_time[depth] = round(elapsed_d, 2)
+        per_depth_tokens[depth] = d_tokens
+        per_depth_draft_time[depth] = round(d_draft_time, 2)
+        per_depth_verify_time[depth] = round(d_verify_time, 2)
+        per_depth_overhead_time[depth] = round(d_overhead_time, 2)
+        print(f"    depth {depth}: α={per_depth_alpha[depth]}, time={per_depth_time[depth]}s")
 
-    elapsed = time.time() - t0
     vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
 
+    # Use deepest depth (22) as the "primary" result for backward compatibility
+    primary = max(model.exit_depths)
     return {
         "method": "eesd_heavy_true_exit",
-        "alpha": round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0,
-        "time_sec": round(elapsed, 2),
-        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
-        "total_tokens": total_tokens,
+        "alpha": per_depth_alpha[primary],
+        "time_sec": per_depth_time[primary],
+        "tokens_per_sec": round(per_depth_tokens[primary] / per_depth_time[primary], 2) if per_depth_time[primary] > 0 else 0.0,
+        "total_tokens": per_depth_tokens[primary],
         "vram_mb": round(vram_mb, 1),
-        "draft_time": round(draft_time, 2),
-        "verify_time": round(verify_time, 2),
-        "overhead_time": round(overhead_time, 2),
+        "draft_time": per_depth_draft_time[primary],
+        "verify_time": per_depth_verify_time[primary],
+        "overhead_time": per_depth_overhead_time[primary],
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_time": per_depth_time,
+        "per_depth_draft_time": per_depth_draft_time,
+        "per_depth_verify_time": per_depth_verify_time,
     }
 
 
@@ -231,42 +286,65 @@ def run_eesd_bottleneck_true_exit(prompts, model, tokenizer, args):
     model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
     model.eval()
 
-    total_tokens = 0
-    total_accepted = 0
-    total_drafted = 0
-    draft_time = 0.0
-    verify_time = 0.0
-    overhead_time = 0.0
-    t0 = time.time()
+    per_depth_accepted = {}
+    per_depth_drafted = {}
+    per_depth_alpha = {}
+    per_depth_time = {}
+    per_depth_tokens = {}
+    per_depth_draft_time = {}
+    per_depth_verify_time = {}
 
-    for prompt_text, input_ids in prompts:
-        text, stats = eesd_generate_true_exit(
-            model, tokenizer, prompt_text,
-            max_new_tokens=args.max_new_tokens, K=args.K, exit_depth=22,
-        )
-        total_drafted += stats["total_drafted"]
-        total_accepted += stats["total_accepted"]
-        total_tokens += stats["new_tokens"]
-        draft_time += stats["draft_time"]
-        verify_time += stats["verify_time"]
-        overhead_time += stats["overhead_time"]
+    for depth in model.exit_depths:
+        d_tokens = 0
+        d_accepted = 0
+        d_drafted = 0
+        d_draft_time = 0.0
+        d_verify_time = 0.0
+        d_overhead_time = 0.0
+        t0 = time.time()
+        for prompt_text, input_ids in prompts:
+            text, stats = eesd_generate_true_exit(
+                model, tokenizer, prompt_text,
+                max_new_tokens=args.max_new_tokens, K=args.K, exit_depth=depth,
+            )
+            d_drafted += stats["total_drafted"]
+            d_accepted += stats["total_accepted"]
+            d_tokens += stats["new_tokens"]
+            d_draft_time += stats["draft_time"]
+            d_verify_time += stats["verify_time"]
+            d_overhead_time += stats["overhead_time"]
+        elapsed_d = time.time() - t0
+        per_depth_accepted[depth] = d_accepted
+        per_depth_drafted[depth] = d_drafted
+        per_depth_alpha[depth] = round(d_accepted / d_drafted, 4) if d_drafted > 0 else 0.0
+        per_depth_time[depth] = round(elapsed_d, 2)
+        per_depth_tokens[depth] = d_tokens
+        per_depth_draft_time[depth] = round(d_draft_time, 2)
+        per_depth_verify_time[depth] = round(d_verify_time, 2)
+        print(f"    depth {depth}: α={per_depth_alpha[depth]}, time={per_depth_time[depth]}s")
 
-    elapsed = time.time() - t0
     vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
 
     # Restore heavy exit heads so subsequent methods work correctly
     model.exit_heads = original_exit_heads
 
+    primary = max(model.exit_depths)
     return {
         "method": "eesd_bottleneck_true_exit",
-        "alpha": round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0,
-        "time_sec": round(elapsed, 2),
-        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
-        "total_tokens": total_tokens,
+        "alpha": per_depth_alpha[primary],
+        "time_sec": per_depth_time[primary],
+        "tokens_per_sec": round(per_depth_tokens[primary] / per_depth_time[primary], 2) if per_depth_time[primary] > 0 else 0.0,
+        "total_tokens": per_depth_tokens[primary],
         "vram_mb": round(vram_mb, 1),
-        "draft_time": round(draft_time, 2),
-        "verify_time": round(verify_time, 2),
-        "overhead_time": round(overhead_time, 2),
+        "draft_time": per_depth_draft_time[primary],
+        "verify_time": per_depth_verify_time[primary],
+        "overhead_time": round(sum(per_depth_time.values()) - sum(per_depth_draft_time.values()) - sum(per_depth_verify_time.values()), 2),
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_time": per_depth_time,
+        "per_depth_draft_time": per_depth_draft_time,
+        "per_depth_verify_time": per_depth_verify_time,
     }
 
 
@@ -287,6 +365,8 @@ def run_eesd_thompson(prompts, model, tokenizer, args):
     verify_time = 0.0
     overhead_time = 0.0
     depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
     t0 = time.time()
 
     for prompt_text, input_ids in prompts:
@@ -302,9 +382,16 @@ def run_eesd_thompson(prompts, model, tokenizer, args):
         overhead_time += stats["overhead_time"]
         for d in model.exit_depths:
             depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
 
     elapsed = time.time() - t0
     vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
 
     return {
         "method": "eesd_thompson",
@@ -317,6 +404,9 @@ def run_eesd_thompson(prompts, model, tokenizer, args):
         "verify_time": round(verify_time, 2),
         "overhead_time": round(overhead_time, 2),
         "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
     }
 
 
@@ -334,6 +424,8 @@ def run_eesd_entropy_exit(prompts, model, tokenizer, args):
     verify_time = 0.0
     overhead_time = 0.0
     depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
     t0 = time.time()
     for prompt_text, input_ids in prompts:
         text, stats = eesd_generate_entropy_exit(
@@ -348,8 +440,16 @@ def run_eesd_entropy_exit(prompts, model, tokenizer, args):
         overhead_time += stats["overhead_time"]
         for d in model.exit_depths:
             depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
     elapsed = time.time() - t0
     vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
     return {
         "method": "eesd_entropy_exit",
         "alpha": round(total_accepted / total_drafted, 4) if total_drafted > 0 else 0.0,
@@ -361,6 +461,9 @@ def run_eesd_entropy_exit(prompts, model, tokenizer, args):
         "verify_time": round(verify_time, 2),
         "overhead_time": round(overhead_time, 2),
         "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
     }
 
 
@@ -479,15 +582,21 @@ def analyze_morphology(generated_tokens_list, acceptance_mask_list, tokenizer):
 
     for tokens, mask in zip(generated_tokens_list, acceptance_mask_list):
         for tok_id, accepted in zip(tokens, mask):
-            text = tokenizer.decode([tok_id]).strip()
+            # Decode and strip BPE artifacts (Qwen2 uses Ġ/▁ prefix for word boundaries)
+            raw = tokenizer.decode([tok_id])
+            text = raw.strip().replace("▁", "").replace("Ġ", "")
             if not text:
                 continue
 
-            if text in POSTPOSITIONS:
+            # Extract only Devanagari characters for matching
+            devanagari = "".join(ch for ch in text if "\u0900" <= ch <= "\u097F")
+            if not devanagari:
+                cat = "other"
+            elif devanagari in POSTPOSITIONS:
                 cat = "postpositions"
-            elif text.endswith(VERB_SUFFIXES):
+            elif devanagari.endswith(VERB_SUFFIXES):
                 cat = "verb_forms"
-            elif len(text) >= 5 and any("\u0900" <= ch <= "\u097F" for ch in text):
+            elif len(devanagari) >= 4:
                 cat = "compounds"
             else:
                 cat = "other"

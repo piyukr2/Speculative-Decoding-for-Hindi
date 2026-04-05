@@ -210,6 +210,8 @@ def eesd_generate_thompson(
     draft_time_total = 0.0
     verify_time_total = 0.0
     depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
 
     start_time = time.time()
 
@@ -231,6 +233,7 @@ def eesd_generate_thompson(
 
         draft_ids = torch.cat(draft_tokens, dim=1)
         drafted_total += K
+        per_depth_drafted[exit_depth] += K
 
         # --- VERIFY phase: full model forward ---
         t0 = time.time()
@@ -254,6 +257,7 @@ def eesd_generate_thompson(
 
         matched_total += n_matched
         accepted_total += len(accepted)
+        per_depth_accepted[exit_depth] += n_matched
 
         # Update Thompson Sampling controller
         controller.update(exit_depth, n_matched, K)
@@ -272,6 +276,11 @@ def eesd_generate_thompson(
         generated[0, input_ids.size(1):], skip_special_tokens=True
     )
 
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
     stats = {
         "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
         "time": elapsed,
@@ -283,6 +292,9 @@ def eesd_generate_thompson(
         "total_accepted": accepted_total,
         "new_tokens": new_tokens,
         "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
     }
 
     return generated_text, stats
@@ -317,6 +329,8 @@ def eesd_generate_entropy_exit(
     draft_time_total = 0.0
     verify_time_total = 0.0
     depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
 
     start_time = time.time()
 
@@ -324,6 +338,7 @@ def eesd_generate_entropy_exit(
         # --- DRAFT phase: entropy-based depth selection ---
         t0 = time.time()
         draft_tokens = []
+        draft_chosen_depths = []
         cur_ids = generated.clone()
         for _ in range(K):
             chosen_depth = None
@@ -337,7 +352,9 @@ def eesd_generate_entropy_exit(
                     draft_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
                     break
             depth_usage[chosen_depth] += 1
+            per_depth_drafted[chosen_depth] += 1
             draft_tokens.append(draft_token)
+            draft_chosen_depths.append(chosen_depth)
             cur_ids = torch.cat([cur_ids, draft_token], dim=1)
         draft_time_total += time.time() - t0
 
@@ -359,6 +376,7 @@ def eesd_generate_entropy_exit(
             if full_token.item() == draft_token.item():
                 accepted.append(draft_token.unsqueeze(1))
                 n_matched += 1
+                per_depth_accepted[draft_chosen_depths[i]] += 1
             else:
                 accepted.append(full_token.unsqueeze(1))
                 break
@@ -379,6 +397,11 @@ def eesd_generate_entropy_exit(
         generated[0, input_ids.size(1):], skip_special_tokens=True
     )
 
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
     stats = {
         "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
         "time": elapsed,
@@ -390,6 +413,9 @@ def eesd_generate_entropy_exit(
         "total_accepted": matched_total,
         "new_tokens": new_tokens,
         "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
     }
 
     return generated_text, stats
