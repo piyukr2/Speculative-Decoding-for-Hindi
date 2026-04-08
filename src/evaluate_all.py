@@ -1,8 +1,9 @@
 """
 Unified evaluation for all EESD methods.
 
-7 methods: autoregressive, draft-model, EESD-heavy-hook, EESD-heavy-true-exit,
-           EESD-bottleneck-true-exit, EESD-thompson, EESD-entropy-exit
+8 methods: autoregressive, draft-model, EESD-heavy-hook, EESD-heavy-true-exit,
+           EESD-bottleneck-true-exit, EESD-thompson, EESD-thompson-bottleneck,
+           EESD-entropy-exit
 Plus: K-ablation, morphological analysis, losslessness verification,
       latency breakdown, prompt-length ablation, cross-lingual comparison.
 """
@@ -289,7 +290,11 @@ def run_eesd_bottleneck_true_exit(prompts, model, tokenizer, args):
     model.exit_heads = torch.nn.ModuleDict(
         {str(d): BottleneckExitHead(hidden_size, vocab_size) for d in model.exit_depths}
     )
-    model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
+    try:
+        model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
+    except FileNotFoundError:
+        model.exit_heads = original_exit_heads
+        raise
     model.eval()
 
     per_depth_accepted = {}
@@ -401,6 +406,81 @@ def run_eesd_thompson(prompts, model, tokenizer, args):
 
     return {
         "method": "eesd_thompson",
+        "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "time_sec": round(elapsed, 2),
+        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tokens": total_tokens,
+        "vram_mb": round(vram_mb, 1),
+        "draft_time": round(draft_time, 2),
+        "verify_time": round(verify_time, 2),
+        "overhead_time": round(overhead_time, 2),
+        "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+    }
+
+
+@torch.no_grad()
+def run_eesd_thompson_bottleneck(prompts, model, tokenizer, args):
+    """EESD with Thompson Sampling depth selection + bottleneck exit heads."""
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Replace exit heads with bottleneck variants and load weights
+    hidden_size = model.base_model.config.hidden_size
+    vocab_size = model.base_model.config.vocab_size
+    original_exit_heads = model.exit_heads  # save to restore later
+    model.exit_heads = torch.nn.ModuleDict(
+        {str(d): BottleneckExitHead(hidden_size, vocab_size) for d in model.exit_depths}
+    )
+    try:
+        model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
+    except FileNotFoundError:
+        model.exit_heads = original_exit_heads
+        raise
+    model.eval()
+
+    total_tokens = 0
+    total_matched = 0
+    total_drafted = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    overhead_time = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+    t0 = time.time()
+
+    for prompt_text, input_ids, *_ in prompts:
+        text, stats = eesd_generate_thompson(
+            model, tokenizer, prompt_text,
+            max_new_tokens=args.max_new_tokens, K=args.K,
+        )
+        total_drafted += stats["total_drafted"]
+        total_matched += stats["total_matched"]
+        total_tokens += stats["new_tokens"]
+        draft_time += stats["draft_time"]
+        verify_time += stats["verify_time"]
+        overhead_time += stats["overhead_time"]
+        for d in model.exit_depths:
+            depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
+
+    elapsed = time.time() - t0
+    vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    # Restore heavy exit heads so subsequent methods work correctly
+    model.exit_heads = original_exit_heads
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    return {
+        "method": "eesd_thompson_bottleneck",
         "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
         "time_sec": round(elapsed, 2),
         "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
@@ -1004,7 +1084,7 @@ def main(args):
     all_results = {}
 
     # --- 1. Autoregressive baseline ---
-    print("\n[1/7] Autoregressive baseline...")
+    print("\n[1/8] Autoregressive baseline...")
     ar = run_autoregressive(prompts, tokenizer, model, args)
     ar_time = ar["time_sec"]
     ar["speedup"] = 1.0
@@ -1013,7 +1093,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 2. Draft model ---
-    print("\n[2/7] Draft model (Qwen2-0.5B + Qwen2-1.5B)...")
+    print("\n[2/8] Draft model (Qwen2-0.5B + Qwen2-1.5B)...")
     dm = run_draft_model(prompts, tokenizer, args)
     dm["speedup"] = round(ar_time / dm["time_sec"], 3) if dm["time_sec"] > 0 else 0.0
     all_results["draft_model"] = dm
@@ -1021,7 +1101,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 3. EESD heavy hook ---
-    print("\n[3/7] EESD heavy hook...")
+    print("\n[3/8] EESD heavy hook...")
     eh = run_eesd_heavy_hook(prompts, model, tokenizer, args)
     eh["speedup"] = round(ar_time / eh["time_sec"], 3) if eh["time_sec"] > 0 else 0.0
     all_results["eesd_heavy_hook"] = eh
@@ -1029,7 +1109,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 4. EESD heavy true exit ---
-    print("\n[4/7] EESD heavy true exit...")
+    print("\n[4/8] EESD heavy true exit...")
     model.load_exit_heads("EESD/exit_heads_final.pt")
     ht = run_eesd_heavy_true_exit(prompts, model, tokenizer, args)
     ht["speedup"] = round(ar_time / ht["time_sec"], 3) if ht["time_sec"] > 0 else 0.0
@@ -1038,7 +1118,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 5. EESD bottleneck true exit ---
-    print("\n[5/7] EESD bottleneck true exit...")
+    print("\n[5/8] EESD bottleneck true exit...")
     try:
         bt = run_eesd_bottleneck_true_exit(prompts, model, tokenizer, args)
         bt["speedup"] = round(ar_time / bt["time_sec"], 3) if bt["time_sec"] > 0 else 0.0
@@ -1050,7 +1130,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 6. EESD Thompson ---
-    print("\n[6/7] EESD Thompson...")
+    print("\n[6/8] EESD Thompson...")
     # Reload heavy heads for Thompson
     model.load_exit_heads("EESD/exit_heads_final.pt")
     th = run_eesd_thompson(prompts, model, tokenizer, args)
@@ -1059,8 +1139,20 @@ def main(args):
     print(f"  α={th['alpha']}, speedup={th['speedup']}x, depth_usage={th['depth_usage']}")
     _checkpoint(all_results, args.output_path)
 
-    # --- 7. EESD entropy exit ---
-    print("\n[7/7] EESD entropy exit...")
+    # --- 7. EESD Thompson bottleneck ---
+    print("\n[7/8] EESD Thompson bottleneck...")
+    try:
+        tb = run_eesd_thompson_bottleneck(prompts, model, tokenizer, args)
+        tb["speedup"] = round(ar_time / tb["time_sec"], 3) if tb["time_sec"] > 0 else 0.0
+        all_results["eesd_thompson_bottleneck"] = tb
+        print(f"  α={tb['alpha']}, speedup={tb['speedup']}x, depth_usage={tb['depth_usage']}")
+    except FileNotFoundError:
+        print("  SKIPPED — bottleneck checkpoint not found (EESD/bottleneck_exit_heads_final.pt)")
+        all_results["eesd_thompson_bottleneck"] = {"method": "eesd_thompson_bottleneck", "skipped": True}
+    _checkpoint(all_results, args.output_path)
+
+    # --- 8. EESD entropy exit ---
+    print("\n[8/8] EESD entropy exit...")
     model.load_exit_heads("EESD/exit_heads_final.pt")
     ee = run_eesd_entropy_exit(prompts, model, tokenizer, args)
     ee["speedup"] = round(ar_time / ee["time_sec"], 3) if ee["time_sec"] > 0 else 0.0
@@ -1182,7 +1274,7 @@ def main(args):
 
     # --- Latency breakdown ---
     latency = {}
-    for method_name in ["eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson", "eesd_entropy_exit"]:
+    for method_name in ["eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson", "eesd_thompson_bottleneck", "eesd_entropy_exit"]:
         r = all_results[method_name]
         if "draft_time" in r:
             latency[method_name] = {
@@ -1204,7 +1296,7 @@ def main(args):
     print(f"{'-'*70}")
     for name in ["autoregressive", "draft_model", "eesd_heavy_hook",
                   "eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson",
-                  "eesd_entropy_exit"]:
+                  "eesd_thompson_bottleneck", "eesd_entropy_exit"]:
         r = all_results.get(name, {})
         if r.get("skipped"):
             print(f"{name:<30} {'SKIPPED':>8}")
