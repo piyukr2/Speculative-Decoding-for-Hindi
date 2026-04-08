@@ -177,6 +177,7 @@ def eesd_generate_true_exit(
         "verify_time": verify_time_total,
         "overhead_time": overhead_time,
         "total_drafted": drafted_total,
+        "total_matched": matched_total,
         "total_accepted": accepted_total,
         "new_tokens": new_tokens,
     }
@@ -289,6 +290,7 @@ def eesd_generate_thompson(
         "verify_time": verify_time_total,
         "overhead_time": overhead_time,
         "total_drafted": drafted_total,
+        "total_matched": matched_total,
         "total_accepted": accepted_total,
         "new_tokens": new_tokens,
         "depth_usage": depth_usage,
@@ -410,6 +412,7 @@ def eesd_generate_entropy_exit(
         "verify_time": verify_time_total,
         "overhead_time": overhead_time,
         "total_drafted": drafted_total,
+        "total_matched": matched_total,
         "total_accepted": matched_total,
         "new_tokens": new_tokens,
         "depth_usage": depth_usage,
