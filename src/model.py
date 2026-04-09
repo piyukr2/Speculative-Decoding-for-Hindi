@@ -417,3 +417,106 @@ class ThompsonSamplingController:
     def update(self, depth: int, num_accepted: int, num_drafted: int):
         self.alpha[depth] += num_accepted
         self.beta[depth] += (num_drafted - num_accepted)
+
+
+class WeightedThompsonSamplingController:
+    """Thompson Sampling with explicit correctness/time reward weighting.
+
+    Like the original ThompsonSamplingController, depth selection is driven by
+    sampling from Beta posteriors.  The key difference is how the sampled
+    acceptance-rate estimate is combined with a speed bonus:
+
+        score = w_correctness * theta + w_time * (1 - depth / total_layers)
+
+    Defaults: correctness 92%, time 8%  (within the 90-95 / 5-10 spec).
+    The Beta prior is updated identically to the original controller
+    (alpha += accepted, beta += rejected) so the underlying Thompson
+    Sampling mechanism is unchanged.
+    """
+
+    def __init__(
+        self,
+        exit_depths: List[int],
+        total_layers: int = 28,
+        w_correctness: float = 0.92,
+        w_time: float = 0.08,
+    ):
+        self.depths = list(exit_depths)
+        self.total_layers = total_layers
+        self.w_correctness = w_correctness
+        self.w_time = w_time
+        self.alpha = {d: 1.0 for d in self.depths}  # Beta prior successes
+        self.beta = {d: 1.0 for d in self.depths}   # Beta prior failures
+
+    def select_depth(self) -> int:
+        import random
+        best_depth = self.depths[0]
+        best_score = -1.0
+        for d in self.depths:
+            theta = random.betavariate(self.alpha[d], self.beta[d])
+            # Weighted score: correctness dominates, speed is a tiebreaker
+            score = (self.w_correctness * theta
+                     + self.w_time * (1.0 - d / self.total_layers))
+            if score > best_score:
+                best_score = score
+                best_depth = d
+        return best_depth
+
+    def update(self, depth: int, num_accepted: int, num_drafted: int):
+        self.alpha[depth] += num_accepted
+        self.beta[depth] += (num_drafted - num_accepted)
+
+
+class UCBController:
+    """Dynamically selects exit depth using Upper Confidence Bound (UCB1).
+
+    Reward definition:
+      reward = w_correctness * (accepted/drafted) + w_time * (1 - depth/total_layers)
+
+    Correctness gets 90-95% weight (default 0.92) and time/speed gets
+    5-10% weight (default 0.08), so the algorithm strongly prioritises
+    accuracy while still nudging towards faster (shallower) depths.
+    """
+
+    def __init__(
+        self,
+        exit_depths: List[int],
+        total_layers: int = 28,
+        w_correctness: float = 0.92,
+        w_time: float = 0.08,
+        c: float = 1.41,
+    ):
+        self.depths = list(exit_depths)
+        self.total_layers = total_layers
+        self.w_correctness = w_correctness
+        self.w_time = w_time
+        self.c = c  # exploration parameter (sqrt(2) ≈ 1.41 is standard UCB1)
+        self.counts: Dict[int, int] = {d: 0 for d in self.depths}
+        self.total_reward: Dict[int, float] = {d: 0.0 for d in self.depths}
+        self.total_rounds: int = 0
+
+    def select_depth(self) -> int:
+        import math
+        # Ensure each arm is tried at least once (initialisation phase)
+        for d in self.depths:
+            if self.counts[d] == 0:
+                return d
+
+        best_depth = self.depths[0]
+        best_ucb = -float("inf")
+        for d in self.depths:
+            avg_reward = self.total_reward[d] / self.counts[d]
+            exploration = self.c * math.sqrt(math.log(self.total_rounds) / self.counts[d])
+            ucb_score = avg_reward + exploration
+            if ucb_score > best_ucb:
+                best_ucb = ucb_score
+                best_depth = d
+        return best_depth
+
+    def update(self, depth: int, num_accepted: int, num_drafted: int):
+        correctness = num_accepted / num_drafted if num_drafted > 0 else 0.0
+        time_bonus = 1.0 - (depth / self.total_layers)
+        reward = self.w_correctness * correctness + self.w_time * time_bonus
+        self.counts[depth] += 1
+        self.total_reward[depth] += reward
+        self.total_rounds += 1

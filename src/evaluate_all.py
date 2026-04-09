@@ -1,9 +1,10 @@
 """
 Unified evaluation for all EESD methods.
 
-8 methods: autoregressive, draft-model, EESD-heavy-hook, EESD-heavy-true-exit,
-           EESD-bottleneck-true-exit, EESD-thompson, EESD-thompson-bottleneck,
-           EESD-entropy-exit
+12 methods: autoregressive, draft-model, EESD-heavy-hook, EESD-heavy-true-exit,
+            EESD-bottleneck-true-exit, EESD-thompson, EESD-thompson-bottleneck,
+            EESD-entropy-exit, EESD-UCB-bottleneck, EESD-UCB-hook,
+            EESD-weighted-thompson-bottleneck, EESD-weighted-thompson-hook
 Plus: K-ablation, morphological analysis, losslessness verification,
       latency breakdown, prompt-length ablation, cross-lingual comparison.
 """
@@ -25,8 +26,10 @@ from transformers import AutoTokenizer
 
 from transformers import AutoModelForCausalLM
 
-from src.model import EarlyExitLM, BottleneckExitHead, ThompsonSamplingController
-from src.inference import eesd_generate, eesd_generate_true_exit, eesd_generate_thompson, eesd_generate_entropy_exit
+from src.model import EarlyExitLM, BottleneckExitHead, ThompsonSamplingController, WeightedThompsonSamplingController, UCBController
+from src.inference import (eesd_generate, eesd_generate_true_exit, eesd_generate_thompson,
+                           eesd_generate_entropy_exit, eesd_generate_ucb, eesd_generate_ucb_hook,
+                           eesd_generate_weighted_thompson, eesd_generate_weighted_thompson_hook)
 from src.draft_model_baseline import speculative_decode_step
 
 
@@ -538,6 +541,298 @@ def run_eesd_entropy_exit(prompts, model, tokenizer, args):
 
     return {
         "method": "eesd_entropy_exit",
+        "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "time_sec": round(elapsed, 2),
+        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tokens": total_tokens,
+        "vram_mb": round(vram_mb, 1),
+        "draft_time": round(draft_time, 2),
+        "verify_time": round(verify_time, 2),
+        "overhead_time": round(overhead_time, 2),
+        "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+    }
+
+
+@torch.no_grad()
+def run_eesd_weighted_thompson_bottleneck(prompts, model, tokenizer, args):
+    """Weighted Thompson Sampling + bottleneck exit heads + true early exit.
+
+    Score = 0.92 * theta + 0.08 * (1 - d/L).
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Replace exit heads with bottleneck variants and load weights
+    hidden_size = model.base_model.config.hidden_size
+    vocab_size = model.base_model.config.vocab_size
+    original_exit_heads = model.exit_heads  # save to restore later
+    model.exit_heads = torch.nn.ModuleDict(
+        {str(d): BottleneckExitHead(hidden_size, vocab_size) for d in model.exit_depths}
+    )
+    try:
+        model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
+    except FileNotFoundError:
+        model.exit_heads = original_exit_heads
+        raise
+    model.eval()
+
+    total_tokens = 0
+    total_matched = 0
+    total_drafted = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    overhead_time = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+    t0 = time.time()
+
+    for prompt_text, input_ids, *_ in prompts:
+        text, stats = eesd_generate_weighted_thompson(
+            model, tokenizer, prompt_text,
+            max_new_tokens=args.max_new_tokens, K=args.K,
+            w_correctness=0.92, w_time=0.08,
+        )
+        total_drafted += stats["total_drafted"]
+        total_matched += stats["total_matched"]
+        total_tokens += stats["new_tokens"]
+        draft_time += stats["draft_time"]
+        verify_time += stats["verify_time"]
+        overhead_time += stats["overhead_time"]
+        for d in model.exit_depths:
+            depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
+
+    elapsed = time.time() - t0
+    vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    # Restore heavy exit heads so subsequent methods work correctly
+    model.exit_heads = original_exit_heads
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    return {
+        "method": "eesd_weighted_thompson_bottleneck",
+        "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "time_sec": round(elapsed, 2),
+        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tokens": total_tokens,
+        "vram_mb": round(vram_mb, 1),
+        "draft_time": round(draft_time, 2),
+        "verify_time": round(verify_time, 2),
+        "overhead_time": round(overhead_time, 2),
+        "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+    }
+
+
+@torch.no_grad()
+def run_eesd_weighted_thompson_hook(prompts, model, tokenizer, args):
+    """Weighted Thompson Sampling + heavy exit heads + hook-based drafting.
+
+    Runs all layers during drafting but reads hidden state at the
+    Thompson-selected depth via a forward hook.
+    Score = 0.92 * theta + 0.08 * (1 - d/L).
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    model.load_exit_heads("EESD/exit_heads_final.pt")
+    model.eval()
+
+    total_tokens = 0
+    total_matched = 0
+    total_drafted = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    overhead_time = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+    t0 = time.time()
+
+    for prompt_text, input_ids, *_ in prompts:
+        text, stats = eesd_generate_weighted_thompson_hook(
+            model, tokenizer, prompt_text,
+            max_new_tokens=args.max_new_tokens, K=args.K,
+            w_correctness=0.92, w_time=0.08,
+        )
+        total_drafted += stats["total_drafted"]
+        total_matched += stats["total_matched"]
+        total_tokens += stats["new_tokens"]
+        draft_time += stats["draft_time"]
+        verify_time += stats["verify_time"]
+        overhead_time += stats["overhead_time"]
+        for d in model.exit_depths:
+            depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
+
+    elapsed = time.time() - t0
+    vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    return {
+        "method": "eesd_weighted_thompson_hook",
+        "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "time_sec": round(elapsed, 2),
+        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tokens": total_tokens,
+        "vram_mb": round(vram_mb, 1),
+        "draft_time": round(draft_time, 2),
+        "verify_time": round(verify_time, 2),
+        "overhead_time": round(overhead_time, 2),
+        "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+    }
+
+
+@torch.no_grad()
+def run_eesd_ucb_bottleneck(prompts, model, tokenizer, args):
+    """EESD with UCB1 depth selection + bottleneck exit heads + true early exit.
+
+    Reward: 92% correctness + 8% speed bonus for shallower depths.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # Replace exit heads with bottleneck variants and load weights
+    hidden_size = model.base_model.config.hidden_size
+    vocab_size = model.base_model.config.vocab_size
+    original_exit_heads = model.exit_heads  # save to restore later
+    model.exit_heads = torch.nn.ModuleDict(
+        {str(d): BottleneckExitHead(hidden_size, vocab_size) for d in model.exit_depths}
+    )
+    try:
+        model.load_exit_heads("EESD/bottleneck_exit_heads_final.pt")
+    except FileNotFoundError:
+        model.exit_heads = original_exit_heads
+        raise
+    model.eval()
+
+    total_tokens = 0
+    total_matched = 0
+    total_drafted = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    overhead_time = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+    t0 = time.time()
+
+    for prompt_text, input_ids, *_ in prompts:
+        text, stats = eesd_generate_ucb(
+            model, tokenizer, prompt_text,
+            max_new_tokens=args.max_new_tokens, K=args.K,
+            w_correctness=0.92, w_time=0.08,
+        )
+        total_drafted += stats["total_drafted"]
+        total_matched += stats["total_matched"]
+        total_tokens += stats["new_tokens"]
+        draft_time += stats["draft_time"]
+        verify_time += stats["verify_time"]
+        overhead_time += stats["overhead_time"]
+        for d in model.exit_depths:
+            depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
+
+    elapsed = time.time() - t0
+    vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    # Restore heavy exit heads so subsequent methods work correctly
+    model.exit_heads = original_exit_heads
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    return {
+        "method": "eesd_ucb_bottleneck",
+        "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
+        "time_sec": round(elapsed, 2),
+        "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
+        "total_tokens": total_tokens,
+        "vram_mb": round(vram_mb, 1),
+        "draft_time": round(draft_time, 2),
+        "verify_time": round(verify_time, 2),
+        "overhead_time": round(overhead_time, 2),
+        "depth_usage": depth_usage,
+        "per_depth_alpha": per_depth_alpha,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+    }
+
+
+@torch.no_grad()
+def run_eesd_ucb_hook(prompts, model, tokenizer, args):
+    """EESD with UCB1 depth selection + heavy exit heads + hook-based drafting.
+
+    Runs all layers during drafting but reads hidden state at UCB-selected
+    depth via a forward hook.
+    Reward: 92% correctness + 8% speed bonus for shallower depths.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    model.load_exit_heads("EESD/exit_heads_final.pt")
+    model.eval()
+
+    total_tokens = 0
+    total_matched = 0
+    total_drafted = 0
+    draft_time = 0.0
+    verify_time = 0.0
+    overhead_time = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+    t0 = time.time()
+
+    for prompt_text, input_ids, *_ in prompts:
+        text, stats = eesd_generate_ucb_hook(
+            model, tokenizer, prompt_text,
+            max_new_tokens=args.max_new_tokens, K=args.K,
+            w_correctness=0.92, w_time=0.08,
+        )
+        total_drafted += stats["total_drafted"]
+        total_matched += stats["total_matched"]
+        total_tokens += stats["new_tokens"]
+        draft_time += stats["draft_time"]
+        verify_time += stats["verify_time"]
+        overhead_time += stats["overhead_time"]
+        for d in model.exit_depths:
+            depth_usage[d] += stats["depth_usage"].get(d, 0)
+            per_depth_accepted[d] += stats["per_depth_accepted"].get(d, 0)
+            per_depth_drafted[d] += stats["per_depth_drafted"].get(d, 0)
+
+    elapsed = time.time() - t0
+    vram_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    return {
+        "method": "eesd_ucb_hook",
         "alpha": round(total_matched / total_drafted, 4) if total_drafted > 0 else 0.0,
         "time_sec": round(elapsed, 2),
         "tokens_per_sec": round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0,
@@ -1084,7 +1379,7 @@ def main(args):
     all_results = {}
 
     # --- 1. Autoregressive baseline ---
-    print("\n[1/8] Autoregressive baseline...")
+    print("\n[1/12] Autoregressive baseline...")
     ar = run_autoregressive(prompts, tokenizer, model, args)
     ar_time = ar["time_sec"]
     ar["speedup"] = 1.0
@@ -1093,7 +1388,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 2. Draft model ---
-    print("\n[2/8] Draft model (Qwen2-0.5B + Qwen2-1.5B)...")
+    print("\n[2/12] Draft model (Qwen2-0.5B + Qwen2-1.5B)...")
     dm = run_draft_model(prompts, tokenizer, args)
     dm["speedup"] = round(ar_time / dm["time_sec"], 3) if dm["time_sec"] > 0 else 0.0
     all_results["draft_model"] = dm
@@ -1101,7 +1396,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 3. EESD heavy hook ---
-    print("\n[3/8] EESD heavy hook...")
+    print("\n[3/12] EESD heavy hook...")
     eh = run_eesd_heavy_hook(prompts, model, tokenizer, args)
     eh["speedup"] = round(ar_time / eh["time_sec"], 3) if eh["time_sec"] > 0 else 0.0
     all_results["eesd_heavy_hook"] = eh
@@ -1109,7 +1404,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 4. EESD heavy true exit ---
-    print("\n[4/8] EESD heavy true exit...")
+    print("\n[4/12] EESD heavy true exit...")
     model.load_exit_heads("EESD/exit_heads_final.pt")
     ht = run_eesd_heavy_true_exit(prompts, model, tokenizer, args)
     ht["speedup"] = round(ar_time / ht["time_sec"], 3) if ht["time_sec"] > 0 else 0.0
@@ -1118,7 +1413,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 5. EESD bottleneck true exit ---
-    print("\n[5/8] EESD bottleneck true exit...")
+    print("\n[5/12] EESD bottleneck true exit...")
     try:
         bt = run_eesd_bottleneck_true_exit(prompts, model, tokenizer, args)
         bt["speedup"] = round(ar_time / bt["time_sec"], 3) if bt["time_sec"] > 0 else 0.0
@@ -1130,7 +1425,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 6. EESD Thompson ---
-    print("\n[6/8] EESD Thompson...")
+    print("\n[6/12] EESD Thompson...")
     # Reload heavy heads for Thompson
     model.load_exit_heads("EESD/exit_heads_final.pt")
     th = run_eesd_thompson(prompts, model, tokenizer, args)
@@ -1140,7 +1435,7 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 7. EESD Thompson bottleneck ---
-    print("\n[7/8] EESD Thompson bottleneck...")
+    print("\n[7/12] EESD Thompson bottleneck...")
     try:
         tb = run_eesd_thompson_bottleneck(prompts, model, tokenizer, args)
         tb["speedup"] = round(ar_time / tb["time_sec"], 3) if tb["time_sec"] > 0 else 0.0
@@ -1152,12 +1447,52 @@ def main(args):
     _checkpoint(all_results, args.output_path)
 
     # --- 8. EESD entropy exit ---
-    print("\n[8/8] EESD entropy exit...")
+    print("\n[8/12] EESD entropy exit...")
     model.load_exit_heads("EESD/exit_heads_final.pt")
     ee = run_eesd_entropy_exit(prompts, model, tokenizer, args)
     ee["speedup"] = round(ar_time / ee["time_sec"], 3) if ee["time_sec"] > 0 else 0.0
     all_results["eesd_entropy_exit"] = ee
     print(f"  α={ee['alpha']}, speedup={ee['speedup']}x, depth_usage={ee['depth_usage']}")
+    _checkpoint(all_results, args.output_path)
+
+    # --- 9. EESD UCB + Bottleneck ---
+    print("\n[9/12] EESD UCB + Bottleneck...")
+    try:
+        ucb_bn = run_eesd_ucb_bottleneck(prompts, model, tokenizer, args)
+        ucb_bn["speedup"] = round(ar_time / ucb_bn["time_sec"], 3) if ucb_bn["time_sec"] > 0 else 0.0
+        all_results["eesd_ucb_bottleneck"] = ucb_bn
+        print(f"  α={ucb_bn['alpha']}, speedup={ucb_bn['speedup']}x, depth_usage={ucb_bn['depth_usage']}")
+    except FileNotFoundError:
+        print("  SKIPPED — bottleneck checkpoint not found (EESD/bottleneck_exit_heads_final.pt)")
+        all_results["eesd_ucb_bottleneck"] = {"method": "eesd_ucb_bottleneck", "skipped": True}
+    _checkpoint(all_results, args.output_path)
+
+    # --- 10. EESD UCB + Hook ---
+    print("\n[10/12] EESD UCB + Hook...")
+    ucb_hk = run_eesd_ucb_hook(prompts, model, tokenizer, args)
+    ucb_hk["speedup"] = round(ar_time / ucb_hk["time_sec"], 3) if ucb_hk["time_sec"] > 0 else 0.0
+    all_results["eesd_ucb_hook"] = ucb_hk
+    print(f"  α={ucb_hk['alpha']}, speedup={ucb_hk['speedup']}x, depth_usage={ucb_hk['depth_usage']}")
+    _checkpoint(all_results, args.output_path)
+
+    # --- 11. Weighted Thompson Sampling + Bottleneck ---
+    print("\n[11/12] Weighted Thompson + Bottleneck...")
+    try:
+        wt_bn = run_eesd_weighted_thompson_bottleneck(prompts, model, tokenizer, args)
+        wt_bn["speedup"] = round(ar_time / wt_bn["time_sec"], 3) if wt_bn["time_sec"] > 0 else 0.0
+        all_results["eesd_weighted_thompson_bottleneck"] = wt_bn
+        print(f"  α={wt_bn['alpha']}, speedup={wt_bn['speedup']}x, depth_usage={wt_bn['depth_usage']}")
+    except FileNotFoundError:
+        print("  SKIPPED — bottleneck checkpoint not found (EESD/bottleneck_exit_heads_final.pt)")
+        all_results["eesd_weighted_thompson_bottleneck"] = {"method": "eesd_weighted_thompson_bottleneck", "skipped": True}
+    _checkpoint(all_results, args.output_path)
+
+    # --- 12. Weighted Thompson Sampling + Hook ---
+    print("\n[12/12] Weighted Thompson + Hook...")
+    wt_hk = run_eesd_weighted_thompson_hook(prompts, model, tokenizer, args)
+    wt_hk["speedup"] = round(ar_time / wt_hk["time_sec"], 3) if wt_hk["time_sec"] > 0 else 0.0
+    all_results["eesd_weighted_thompson_hook"] = wt_hk
+    print(f"  α={wt_hk['alpha']}, speedup={wt_hk['speedup']}x, depth_usage={wt_hk['depth_usage']}")
     _checkpoint(all_results, args.output_path)
 
     # --- Cross-lingual comparison ---
@@ -1274,7 +1609,10 @@ def main(args):
 
     # --- Latency breakdown ---
     latency = {}
-    for method_name in ["eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson", "eesd_thompson_bottleneck", "eesd_entropy_exit"]:
+    for method_name in ["eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson",
+                        "eesd_thompson_bottleneck", "eesd_entropy_exit",
+                        "eesd_ucb_bottleneck", "eesd_ucb_hook",
+                        "eesd_weighted_thompson_bottleneck", "eesd_weighted_thompson_hook"]:
         r = all_results[method_name]
         if "draft_time" in r:
             latency[method_name] = {
@@ -1296,7 +1634,9 @@ def main(args):
     print(f"{'-'*70}")
     for name in ["autoregressive", "draft_model", "eesd_heavy_hook",
                   "eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson",
-                  "eesd_thompson_bottleneck", "eesd_entropy_exit"]:
+                  "eesd_thompson_bottleneck", "eesd_entropy_exit",
+                  "eesd_ucb_bottleneck", "eesd_ucb_hook",
+                  "eesd_weighted_thompson_bottleneck", "eesd_weighted_thompson_hook"]:
         r = all_results.get(name, {})
         if r.get("skipped"):
             print(f"{name:<30} {'SKIPPED':>8}")

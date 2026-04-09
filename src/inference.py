@@ -28,7 +28,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from transformers import AutoTokenizer
 
-from src.model import EarlyExitLM, ThompsonSamplingController
+from src.model import EarlyExitLM, ThompsonSamplingController, WeightedThompsonSamplingController, UCBController
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +303,274 @@ def eesd_generate_thompson(
 
 
 # ---------------------------------------------------------------------------
+# Weighted Thompson Sampling with true early exit (for Bottleneck variant)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eesd_generate_weighted_thompson(
+    model: EarlyExitLM,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 50,
+    K: int = 3,
+    w_correctness: float = 0.92,
+    w_time: float = 0.08,
+) -> Tuple[str, Dict]:
+    """EESD with true early exit + Weighted Thompson Sampling depth selection.
+
+    Identical loop to eesd_generate_thompson but uses
+    WeightedThompsonSamplingController so the score is
+    w_correctness * theta + w_time * (1 - d/L) instead of
+    theta * (L/d).
+    """
+    device = next(model.exit_heads.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+
+    controller = WeightedThompsonSamplingController(
+        model.exit_depths,
+        total_layers=len(model._get_transformer_layers()),
+        w_correctness=w_correctness,
+        w_time=w_time,
+    )
+
+    generated = input_ids.clone()
+    matched_total = 0
+    accepted_total = 0
+    drafted_total = 0
+    draft_time_total = 0.0
+    verify_time_total = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+
+    start_time = time.time()
+
+    while generated.size(1) - input_ids.size(1) < max_new_tokens:
+        exit_depth = controller.select_depth()
+        depth_usage[exit_depth] += 1
+
+        # --- DRAFT phase: true early exit (partial_forward) ---
+        t0 = time.time()
+        draft_tokens = []
+        cur_ids = generated.clone()
+        for _ in range(K):
+            logits, _ = model.partial_forward(cur_ids, exit_depth)
+            draft_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            draft_tokens.append(draft_token)
+            cur_ids = torch.cat([cur_ids, draft_token], dim=1)
+        draft_time_total += time.time() - t0
+
+        draft_ids = torch.cat(draft_tokens, dim=1)
+        drafted_total += K
+        per_depth_drafted[exit_depth] += K
+
+        # --- VERIFY phase: full model forward ---
+        t0 = time.time()
+        full_input = torch.cat([generated, draft_ids], dim=1)
+        full_out = model.base_model(input_ids=full_input)
+        full_logits = full_out.logits
+
+        T = generated.size(1)
+        accepted = []
+        n_matched = 0
+        for i in range(K):
+            full_token = full_logits[:, T + i - 1, :].argmax(dim=-1)
+            draft_token = draft_ids[:, i]
+            if full_token.item() == draft_token.item():
+                accepted.append(draft_token.unsqueeze(1))
+                n_matched += 1
+            else:
+                accepted.append(full_token.unsqueeze(1))
+                break
+        verify_time_total += time.time() - t0
+
+        matched_total += n_matched
+        accepted_total += len(accepted)
+        per_depth_accepted[exit_depth] += n_matched
+
+        controller.update(exit_depth, n_matched, K)
+
+        accepted_ids = torch.cat(accepted, dim=1)
+        generated = torch.cat([generated, accepted_ids], dim=1)
+
+        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in accepted_ids[0].tolist():
+            break
+
+    elapsed = time.time() - start_time
+    overhead_time = elapsed - draft_time_total - verify_time_total
+    new_tokens = generated.size(1) - input_ids.size(1)
+
+    generated_text = tokenizer.decode(
+        generated[0, input_ids.size(1):], skip_special_tokens=True
+    )
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    stats = {
+        "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
+        "time": elapsed,
+        "tokens_per_sec": new_tokens / elapsed if elapsed > 0 else 0.0,
+        "draft_time": draft_time_total,
+        "verify_time": verify_time_total,
+        "overhead_time": overhead_time,
+        "total_drafted": drafted_total,
+        "total_matched": matched_total,
+        "total_accepted": accepted_total,
+        "new_tokens": new_tokens,
+        "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
+    }
+
+    return generated_text, stats
+
+
+# ---------------------------------------------------------------------------
+# Weighted Thompson Sampling with hook-based drafting (EESD Hook variant)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eesd_generate_weighted_thompson_hook(
+    model: EarlyExitLM,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 50,
+    K: int = 3,
+    w_correctness: float = 0.92,
+    w_time: float = 0.08,
+) -> Tuple[str, Dict]:
+    """EESD with hook-based drafting + Weighted Thompson Sampling.
+
+    Runs all layers during drafting but captures hidden states at the
+    Thompson-selected depth via a forward hook.
+    Score = w_correctness * theta + w_time * (1 - d/L).
+    """
+    device = next(model.exit_heads.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+    layers = model._get_transformer_layers()
+
+    controller = WeightedThompsonSamplingController(
+        model.exit_depths,
+        total_layers=len(layers),
+        w_correctness=w_correctness,
+        w_time=w_time,
+    )
+
+    generated = input_ids.clone()
+    matched_total = 0
+    accepted_total = 0
+    drafted_total = 0
+    draft_time_total = 0.0
+    verify_time_total = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+
+    start_time = time.time()
+
+    while generated.size(1) - input_ids.size(1) < max_new_tokens:
+        exit_depth = controller.select_depth()
+        depth_usage[exit_depth] += 1
+        exit_head = model.exit_heads[str(exit_depth)]
+
+        # --- DRAFT phase: run ALL layers, capture at exit_depth via hook ---
+        t0 = time.time()
+        draft_tokens = []
+        cur_ids = generated.clone()
+        for _ in range(K):
+            captured_hidden: Dict[str, torch.Tensor] = {}
+
+            def hook(module, input, output):
+                h = output[0] if isinstance(output, tuple) else output
+                captured_hidden["h"] = h.float()
+
+            handle = layers[exit_depth - 1].register_forward_hook(hook)
+            model.base_model(input_ids=cur_ids)
+            handle.remove()
+
+            last_hidden = captured_hidden["h"][:, -1:, :]
+            logits = exit_head(last_hidden)
+            draft_token = logits.argmax(dim=-1)  # [1, 1]
+            draft_tokens.append(draft_token)
+            cur_ids = torch.cat([cur_ids, draft_token], dim=1)
+        draft_time_total += time.time() - t0
+
+        draft_ids = torch.cat(draft_tokens, dim=1)
+        drafted_total += K
+        per_depth_drafted[exit_depth] += K
+
+        # --- VERIFY phase: full model forward ---
+        t0 = time.time()
+        full_input = torch.cat([generated, draft_ids], dim=1)
+        full_out = model.base_model(input_ids=full_input)
+        full_logits = full_out.logits
+
+        T = generated.size(1)
+        accepted = []
+        n_matched = 0
+        for i in range(K):
+            full_token = full_logits[:, T + i - 1, :].argmax(dim=-1)
+            draft_token = draft_ids[:, i]
+            if full_token.item() == draft_token.item():
+                accepted.append(draft_token.unsqueeze(1))
+                n_matched += 1
+            else:
+                accepted.append(full_token.unsqueeze(1))
+                break
+        verify_time_total += time.time() - t0
+
+        matched_total += n_matched
+        accepted_total += len(accepted)
+        per_depth_accepted[exit_depth] += n_matched
+
+        controller.update(exit_depth, n_matched, K)
+
+        accepted_ids = torch.cat(accepted, dim=1)
+        generated = torch.cat([generated, accepted_ids], dim=1)
+
+        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in accepted_ids[0].tolist():
+            break
+
+    elapsed = time.time() - start_time
+    overhead_time = elapsed - draft_time_total - verify_time_total
+    new_tokens = generated.size(1) - input_ids.size(1)
+
+    generated_text = tokenizer.decode(
+        generated[0, input_ids.size(1):], skip_special_tokens=True
+    )
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    stats = {
+        "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
+        "time": elapsed,
+        "tokens_per_sec": new_tokens / elapsed if elapsed > 0 else 0.0,
+        "draft_time": draft_time_total,
+        "verify_time": verify_time_total,
+        "overhead_time": overhead_time,
+        "total_drafted": drafted_total,
+        "total_matched": matched_total,
+        "total_accepted": accepted_total,
+        "new_tokens": new_tokens,
+        "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
+    }
+
+    return generated_text, stats
+
+
+# ---------------------------------------------------------------------------
 # Entropy-based confidence exit
 # ---------------------------------------------------------------------------
 
@@ -414,6 +682,277 @@ def eesd_generate_entropy_exit(
         "total_drafted": drafted_total,
         "total_matched": matched_total,
         "total_accepted": matched_total,
+        "new_tokens": new_tokens,
+        "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
+    }
+
+    return generated_text, stats
+
+
+# ---------------------------------------------------------------------------
+# UCB-based depth selection with true early exit
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eesd_generate_ucb(
+    model: EarlyExitLM,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 50,
+    K: int = 3,
+    w_correctness: float = 0.92,
+    w_time: float = 0.08,
+) -> Tuple[str, Dict]:
+    """EESD with true early exit + UCB1 depth selection.
+
+    Uses Upper Confidence Bound to balance exploration and exploitation
+    when choosing exit depth.  Reward weights: correctness 90-95%,
+    speed 5-10%.
+    """
+    device = next(model.exit_heads.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+
+    controller = UCBController(
+        model.exit_depths,
+        total_layers=len(model._get_transformer_layers()),
+        w_correctness=w_correctness,
+        w_time=w_time,
+    )
+
+    generated = input_ids.clone()
+    matched_total = 0
+    accepted_total = 0
+    drafted_total = 0
+    draft_time_total = 0.0
+    verify_time_total = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+
+    start_time = time.time()
+
+    while generated.size(1) - input_ids.size(1) < max_new_tokens:
+        # Select depth via UCB
+        exit_depth = controller.select_depth()
+        depth_usage[exit_depth] += 1
+
+        # --- DRAFT phase: run only first `exit_depth` layers ---
+        t0 = time.time()
+        draft_tokens = []
+        cur_ids = generated.clone()
+        for _ in range(K):
+            logits, _ = model.partial_forward(cur_ids, exit_depth)
+            draft_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            draft_tokens.append(draft_token)
+            cur_ids = torch.cat([cur_ids, draft_token], dim=1)
+        draft_time_total += time.time() - t0
+
+        draft_ids = torch.cat(draft_tokens, dim=1)
+        drafted_total += K
+        per_depth_drafted[exit_depth] += K
+
+        # --- VERIFY phase: full model forward ---
+        t0 = time.time()
+        full_input = torch.cat([generated, draft_ids], dim=1)
+        full_out = model.base_model(input_ids=full_input)
+        full_logits = full_out.logits
+
+        T = generated.size(1)
+        accepted = []
+        n_matched = 0
+        for i in range(K):
+            full_token = full_logits[:, T + i - 1, :].argmax(dim=-1)
+            draft_token = draft_ids[:, i]
+            if full_token.item() == draft_token.item():
+                accepted.append(draft_token.unsqueeze(1))
+                n_matched += 1
+            else:
+                accepted.append(full_token.unsqueeze(1))
+                break
+        verify_time_total += time.time() - t0
+
+        matched_total += n_matched
+        accepted_total += len(accepted)
+        per_depth_accepted[exit_depth] += n_matched
+
+        # Update UCB controller
+        controller.update(exit_depth, n_matched, K)
+
+        accepted_ids = torch.cat(accepted, dim=1)
+        generated = torch.cat([generated, accepted_ids], dim=1)
+
+        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in accepted_ids[0].tolist():
+            break
+
+    elapsed = time.time() - start_time
+    overhead_time = elapsed - draft_time_total - verify_time_total
+    new_tokens = generated.size(1) - input_ids.size(1)
+
+    generated_text = tokenizer.decode(
+        generated[0, input_ids.size(1):], skip_special_tokens=True
+    )
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    stats = {
+        "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
+        "time": elapsed,
+        "tokens_per_sec": new_tokens / elapsed if elapsed > 0 else 0.0,
+        "draft_time": draft_time_total,
+        "verify_time": verify_time_total,
+        "overhead_time": overhead_time,
+        "total_drafted": drafted_total,
+        "total_matched": matched_total,
+        "total_accepted": accepted_total,
+        "new_tokens": new_tokens,
+        "depth_usage": depth_usage,
+        "per_depth_accepted": per_depth_accepted,
+        "per_depth_drafted": per_depth_drafted,
+        "per_depth_alpha": per_depth_alpha,
+    }
+
+    return generated_text, stats
+
+
+# ---------------------------------------------------------------------------
+# UCB-based depth selection with hook-based drafting (EESD Hook)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eesd_generate_ucb_hook(
+    model: EarlyExitLM,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 50,
+    K: int = 3,
+    w_correctness: float = 0.92,
+    w_time: float = 0.08,
+) -> Tuple[str, Dict]:
+    """EESD with hook-based drafting + UCB1 depth selection.
+
+    Unlike the true-exit variant, this runs all layers during drafting
+    but captures hidden states at the UCB-selected depth via a forward
+    hook.  Reward weights: correctness 90-95%, speed 5-10%.
+    """
+    device = next(model.exit_heads.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    input_ids = inputs["input_ids"]
+    layers = model._get_transformer_layers()
+
+    controller = UCBController(
+        model.exit_depths,
+        total_layers=len(layers),
+        w_correctness=w_correctness,
+        w_time=w_time,
+    )
+
+    generated = input_ids.clone()
+    matched_total = 0
+    accepted_total = 0
+    drafted_total = 0
+    draft_time_total = 0.0
+    verify_time_total = 0.0
+    depth_usage = {d: 0 for d in model.exit_depths}
+    per_depth_accepted = {d: 0 for d in model.exit_depths}
+    per_depth_drafted = {d: 0 for d in model.exit_depths}
+
+    start_time = time.time()
+
+    while generated.size(1) - input_ids.size(1) < max_new_tokens:
+        # Select depth via UCB
+        exit_depth = controller.select_depth()
+        depth_usage[exit_depth] += 1
+        exit_head = model.exit_heads[str(exit_depth)]
+
+        # --- DRAFT phase: run ALL layers, capture hidden state at exit_depth via hook ---
+        t0 = time.time()
+        draft_tokens = []
+        cur_ids = generated.clone()
+        for _ in range(K):
+            captured_hidden: Dict[str, torch.Tensor] = {}
+
+            def hook(module, input, output):
+                h = output[0] if isinstance(output, tuple) else output
+                captured_hidden["h"] = h.float()
+
+            handle = layers[exit_depth - 1].register_forward_hook(hook)
+            model.base_model(input_ids=cur_ids)
+            handle.remove()
+
+            last_hidden = captured_hidden["h"][:, -1:, :]
+            logits = exit_head(last_hidden)
+            draft_token = logits.argmax(dim=-1)  # [1, 1]
+            draft_tokens.append(draft_token)
+            cur_ids = torch.cat([cur_ids, draft_token], dim=1)
+        draft_time_total += time.time() - t0
+
+        draft_ids = torch.cat(draft_tokens, dim=1)
+        drafted_total += K
+        per_depth_drafted[exit_depth] += K
+
+        # --- VERIFY phase: full model forward ---
+        t0 = time.time()
+        full_input = torch.cat([generated, draft_ids], dim=1)
+        full_out = model.base_model(input_ids=full_input)
+        full_logits = full_out.logits
+
+        T = generated.size(1)
+        accepted = []
+        n_matched = 0
+        for i in range(K):
+            full_token = full_logits[:, T + i - 1, :].argmax(dim=-1)
+            draft_token = draft_ids[:, i]
+            if full_token.item() == draft_token.item():
+                accepted.append(draft_token.unsqueeze(1))
+                n_matched += 1
+            else:
+                accepted.append(full_token.unsqueeze(1))
+                break
+        verify_time_total += time.time() - t0
+
+        matched_total += n_matched
+        accepted_total += len(accepted)
+        per_depth_accepted[exit_depth] += n_matched
+
+        # Update UCB controller
+        controller.update(exit_depth, n_matched, K)
+
+        accepted_ids = torch.cat(accepted, dim=1)
+        generated = torch.cat([generated, accepted_ids], dim=1)
+
+        if tokenizer.eos_token_id is not None and tokenizer.eos_token_id in accepted_ids[0].tolist():
+            break
+
+    elapsed = time.time() - start_time
+    overhead_time = elapsed - draft_time_total - verify_time_total
+    new_tokens = generated.size(1) - input_ids.size(1)
+
+    generated_text = tokenizer.decode(
+        generated[0, input_ids.size(1):], skip_special_tokens=True
+    )
+
+    per_depth_alpha = {
+        d: round(per_depth_accepted[d] / per_depth_drafted[d], 4) if per_depth_drafted[d] > 0 else 0.0
+        for d in model.exit_depths
+    }
+
+    stats = {
+        "alpha": matched_total / drafted_total if drafted_total > 0 else 0.0,
+        "time": elapsed,
+        "tokens_per_sec": new_tokens / elapsed if elapsed > 0 else 0.0,
+        "draft_time": draft_time_total,
+        "verify_time": verify_time_total,
+        "overhead_time": overhead_time,
+        "total_drafted": drafted_total,
+        "total_matched": matched_total,
+        "total_accepted": accepted_total,
         "new_tokens": new_tokens,
         "depth_usage": depth_usage,
         "per_depth_accepted": per_depth_accepted,
