@@ -1,0 +1,102 @@
+{
+  "postpositions": {
+    "alpha": 1.0,
+    "count": 8
+  },
+  "verb_forms": {
+    "alpha": 0.2667,
+    "count": 15
+  },
+  "compounds": {
+    "alpha": 0.0,
+    "count": 0
+  },
+  "other": {
+    "alpha": 0.5397,
+    "count": 126
+  },
+  "upos_distribution": {
+    "ADJ": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "ADP": {
+      "alpha": 1.0,
+      "count": 8
+    },
+    "AUX": {
+      "alpha": 1.0,
+      "count": 3
+    },
+    "CCONJ": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "DET": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "NOUN": {
+      "alpha": 0.5333,
+      "count": 15
+    },
+    "PRON": {
+      "alpha": 0.75,
+      "count": 4
+    },
+    "PROPN": {
+      "alpha": 0.2857,
+      "count": 21
+    },
+    "PUNCT": {
+      "alpha": 0.5783,
+      "count": 83
+    },
+    "VERB": {
+      "alpha": 0.0833,
+      "count": 12
+    }
+  },
+  "xpos_distribution": {
+    "CC": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "DEM": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "JJ": {
+      "alpha": 1.0,
+      "count": 1
+    },
+    "NN": {
+      "alpha": 0.5333,
+      "count": 15
+    },
+    "NNP": {
+      "alpha": 0.2857,
+      "count": 21
+    },
+    "PRP": {
+      "alpha": 0.75,
+      "count": 4
+    },
+    "PSP": {
+      "alpha": 1.0,
+      "count": 8
+    },
+    "SYM": {
+      "alpha": 0.5783,
+      "count": 83
+    },
+    "VAUX": {
+      "alpha": 1.0,
+      "count": 3
+    },
+    "VM": {
+      "alpha": 0.0833,
+      "count": 12
+    }
+  }
+}

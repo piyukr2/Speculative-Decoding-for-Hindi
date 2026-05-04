@@ -1,0 +1,83 @@
+Morphological (UPOS) Analysis - Plain English Explanation
+==========================================================
+
+What this section is about:
+----------------------------
+This section asks: "When the draft model tries to predict the next word, does it do
+better or worse depending on what *type* of word it's predicting?" To answer this,
+every predicted token is tagged with its grammatical category (called a UPOS tag --
+Universal Part-of-Speech tag), and then we check the acceptance rate for each category
+separately.
+
+The UPOS categories and what they mean:
+-----------------------------------------
+- ADP (Adpositions/Postpositions): Words like "in", "on", "of". In Hindi, these come
+  after the noun (e.g., "ke", "mein", "par").
+
+- AUX (Auxiliaries): Helper verbs like "is", "was", "has been". In Hindi, words like
+  "hai", "tha", "hoga".
+
+- PRON (Pronouns): Words like "he", "she", "it", "they" -- "woh", "yeh", "main" in Hindi.
+
+- PUNCT (Punctuation): Commas, periods, question marks, etc.
+
+- NOUN (Common Nouns): General words for things/concepts -- "ghar" (house), "kitab" (book).
+
+- PROPN (Proper Nouns): Names of specific people, places, organizations -- "Delhi",
+  "Narendra", "Google".
+
+- VERB (Verbs): Action words -- "karna" (to do), "jana" (to go), "likhna" (to write).
+
+
+What the results show:
+-----------------------
+The draft model's accuracy varies dramatically by word type:
+
+1. ADP (100% accepted) and AUX (100% accepted):
+   These are "function words" -- there are only a handful of them in Hindi, and which
+   one to use is almost entirely determined by the surrounding sentence structure. For
+   example, after a noun, the postposition is highly predictable. Since there are so few
+   options, even a lightweight draft model can guess them perfectly.
+
+2. PRON (75% accepted):
+   Pronouns are also a small set, but in Hindi they change form based on gender and
+   number (e.g., "woh" vs "wey"), so there's some ambiguity. The model gets it right
+   3 out of 4 times.
+
+3. PUNCT (58% accepted):
+   Punctuation seems like it should be easy, but in Hindi, comma and period placement
+   is less standardized than in English. The model gets it right a bit more than half
+   the time.
+
+4. NOUN (53% accepted):
+   Common nouns are harder because there are thousands of them, and in Hindi they also
+   carry case markers (suffixes that change based on grammatical role). So the model
+   has to predict both the right word AND the right form of that word.
+
+5. PROPN (29% accepted):
+   Names are very hard to predict. They are "open class" -- new names appear all the
+   time, they don't follow grammatical patterns, and which name appears depends heavily
+   on context/topic. The model only gets about 1 in 3.5 right.
+
+6. VERB (8% accepted):
+   Verbs are the hardest by far. This is because Hindi verbs change form based on the
+   subject's person (I/you/he), number (singular/plural), AND gender (masculine/feminine).
+   For example, "to do" becomes "karta" (masc. sing.), "karti" (fem. sing.), "karte"
+   (masc. plural). The draft model, being smaller and less capable, struggles to predict
+   all these inflectional variations correctly. Only about 1 in 12 verb predictions is
+   accepted.
+
+The key takeaway:
+-----------------
+Simple, grammatically constrained words (function words) are easy for the draft model.
+Complex, content-rich words -- especially verbs with Hindi's rich morphology -- are very
+hard. This tells us that speculative decoding's efficiency depends heavily on the type
+of text being generated. Passages with lots of verbs and proper nouns will see more
+rejected drafts and slower performance.
+
+Important caveat:
+-----------------
+The sample sizes for some categories are very small (only 3 AUX tokens, 4 PRON tokens,
+8 ADP tokens). So the "perfect" scores for ADP and AUX might just be luck -- with only
+3-8 examples, we can't be very confident. The results for PUNCT (83 tokens) and PROPN
+(21 tokens) are more statistically reliable.

@@ -1613,7 +1613,9 @@ def main(args):
                         "eesd_thompson_bottleneck", "eesd_entropy_exit",
                         "eesd_ucb_bottleneck", "eesd_ucb_hook",
                         "eesd_weighted_thompson_bottleneck", "eesd_weighted_thompson_hook"]:
-        r = all_results[method_name]
+        r = all_results.get(method_name, {})
+        if r.get("skipped"):
+            continue
         if "draft_time" in r:
             latency[method_name] = {
                 "draft_time": r["draft_time"],
@@ -1629,9 +1631,9 @@ def main(args):
     print(f"\nAll results saved to {args.output_path}")
 
     # --- Summary table ---
-    print(f"\n{'='*70}")
-    print(f"{'Method':<30} {'α':>8} {'Speedup':>10} {'tok/s':>10} {'VRAM MB':>10}")
-    print(f"{'-'*70}")
+    print(f"\n{'='*80}")
+    print(f"{'Method':<40} {'α':>8} {'Speedup':>10} {'tok/s':>10} {'VRAM MB':>10}")
+    print(f"{'-'*80}")
     for name in ["autoregressive", "draft_model", "eesd_heavy_hook",
                   "eesd_heavy_true_exit", "eesd_bottleneck_true_exit", "eesd_thompson",
                   "eesd_thompson_bottleneck", "eesd_entropy_exit",
@@ -1639,14 +1641,14 @@ def main(args):
                   "eesd_weighted_thompson_bottleneck", "eesd_weighted_thompson_hook"]:
         r = all_results.get(name, {})
         if r.get("skipped"):
-            print(f"{name:<30} {'SKIPPED':>8}")
+            print(f"{name:<40} {'SKIPPED':>8}")
             continue
         alpha = r.get("alpha", "—")
         speedup = r.get("speedup", "—")
         tps = r.get("tokens_per_sec", "—")
         vram = r.get("vram_mb", "—")
-        print(f"{name:<30} {alpha:>8} {speedup:>10} {tps:>10} {vram:>10}")
-    print(f"{'='*70}")
+        print(f"{name:<40} {alpha:>8} {speedup:>10} {tps:>10} {vram:>10}")
+    print(f"{'='*80}")
 
     # --- Sync to Google Drive ---
     print("\n--- Syncing to Google Drive ---")

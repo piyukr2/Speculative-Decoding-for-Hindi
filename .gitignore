@@ -261,3 +261,7 @@ project_explaination.tex
 outputs_v1/
 outputs_v2/
 outputs-20260408T104702Z-3-001.zip
+submission/*
+results_final_small/*
+correct.*
+report_detailed_claude.*
