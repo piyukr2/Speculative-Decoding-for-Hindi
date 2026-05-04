@@ -72,6 +72,7 @@ All training, evaluation, and inference are performed via `Execution_notebook.ip
 
 # Models
 
+- Hugging Face model: [piyukr26/INLP](https://huggingface.co/piyukr26/INLP/tree/main)
 
 ## Final Report Artifacts
 
