@@ -4,9 +4,6 @@ Comprehensive evaluation of Early-Exit Speculative Decoding for Hindi using Qwen
 This repository includes training, inference, unified multi-method benchmarking, visualization notebooks, and ACL-style report artifacts.
 
 - GitHub: https://github.com/piyukr2/Speculative-Decoding-for-Hindi
-- Exit-head checkpoints: https://huggingface.co/piyukr/EESD
-- Colab notebook (train/evaluate/inference): https://colab.research.google.com/drive/1lWGMBimmVMaQ-RQI9R8hEys3JtVxEMgG?usp=drive_link
-- Google Drive (source files, models): https://drive.google.com/drive/folders/1NF3m1lP8Xn9u3rXBdm-T0FYSSVC_S6Wd?usp=drive_link
 
 ## Highlights
 
