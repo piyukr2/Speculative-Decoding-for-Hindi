@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speculative Decoding — How Parallel Verification Works</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#596579;--line:#dce3ef;--blue:#2457d6;--bluebg:#edf3ff;--green:#16804a;--greenbg:#eaf8f0;--orange:#a85b08;--orangebg:#fff4e5;--shadow:0 8px 26px rgba(20,35,70,.07)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+header{background:linear-gradient(125deg,#14284f,#2457d6);color:#fff;padding:54px 20px 48px}
+.hero{max-width:1000px;margin:auto}.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:.78rem;font-weight:750;opacity:.8}
+h1{font-size:clamp(2rem,5vw,3.5rem);line-height:1.1;margin:.5rem 0 1rem;letter-spacing:-.035em}.hero p{max-width:760px;font-size:1.12rem;color:#e4ebff;margin:0}
+main{max-width:1000px;margin:28px auto;padding:0 18px 60px}.toc{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 26px}.toc a{color:var(--blue);text-decoration:none;background:#fff;border:1px solid var(--line);border-radius:999px;padding:7px 12px;font-size:.88rem}
+section,.callout{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:clamp(18px,3vw,30px);margin:20px 0;box-shadow:var(--shadow)}
+h2{font-size:1.55rem;line-height:1.25;margin:0 0 12px;letter-spacing:-.02em}h3{font-size:1.08rem;margin:20px 0 8px}p{margin:10px 0}ul,ol{padding-left:1.4rem}li{margin:.35rem 0}.muted{color:var(--muted)}.small{font-size:.9rem}.callout{box-shadow:none;border-left:5px solid var(--blue);background:var(--bluebg)}.callout.green{border-left-color:var(--green);background:var(--greenbg)}.callout.orange{border-left-color:var(--orange);background:var(--orangebg)}
+.pill{display:inline-block;padding:3px 9px;border-radius:99px;font-size:.8rem;font-weight:750;background:var(--bluebg);color:var(--blue)}
+.flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:stretch;gap:10px;margin:18px 0}.step{border:1px solid var(--line);border-radius:13px;padding:15px;background:#fff}.step strong{display:block;margin-bottom:6px}.arrow{align-self:center;color:var(--blue);font-size:1.5rem;font-weight:800}.tokens{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.token{border:1px solid #b9cafb;background:var(--bluebg);color:#193c96;border-radius:9px;padding:8px 13px;font-weight:700;text-align:center}.token small{display:block;font-size:.7rem;color:#536ba8;font-weight:500}.token.draft{border-color:#efc47d;background:var(--orangebg);color:#804600}.token.accept{border-color:#9ad6b4;background:var(--greenbg);color:#12633a}
+.formula{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#f3f5fa;border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow-wrap:anywhere;margin:12px 0}.matrix{width:100%;border-collapse:collapse;margin:12px 0;font-size:.92rem}.matrix th,.matrix td{border:1px solid var(--line);padding:9px;text-align:center}.matrix th{background:#f2f5fa}.yes{color:var(--green);font-weight:800}.no{color:#9aa4b5}
+details{border:1px solid var(--line);border-radius:11px;padding:12px 15px;margin:10px 0;background:#fff}summary{font-weight:700;cursor:pointer}button{font:inherit;cursor:pointer;border:0;border-radius:10px;background:var(--blue);color:white;padding:10px 14px;font-weight:700}button.secondary{background:#e9eef9;color:#1c3e88}.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}.status{padding:10px 12px;border-radius:10px;background:#f2f5fa;margin-top:10px;min-height:48px}.compare{display:grid;grid-template-columns:1fr 1fr;gap:14px}.compare>div{border:1px solid var(--line);border-radius:13px;padding:16px}.compare h3{margin-top:0}.bar{height:10px;border-radius:99px;background:#e6ebf5;overflow:hidden;margin:10px 0}.bar span{display:block;height:100%;background:var(--blue);width:25%;transition:width .3s}.quiz-option{display:block;width:100%;text-align:left;margin:8px 0;background:#f4f6fb;color:var(--ink);border:1px solid var(--line)}.quiz-option:hover{border-color:var(--blue)}#quizFeedback{font-weight:650;margin-top:10px}
+footer{text-align:center;color:var(--muted);font-size:.88rem;padding:0 18px 30px}
+@media(max-width:700px){.flow{grid-template-columns:1fr}.arrow{transform:rotate(90deg);justify-self:center}.compare{grid-template-columns:1fr}.matrix{font-size:.78rem}.matrix th,.matrix td{padding:6px}}
+</style>
+</head>
+<body>
+<header><div class="hero">
+<div class="eyebrow">A visual mini-lesson</div>
+<h1>Speculative Decoding</h1>
+<p>How can a large language model verify several future tokens in one forward pass if text generation is autoregressive? The answer is the difference between <strong>generating unknown tokens</strong> and <strong>evaluating tokens that have already been proposed</strong>.</p>
+</div></header>
+<main>
+<nav class="toc" aria-label="Lesson sections">
+<a href="#big-picture">Big picture</a><a href="#workflow">Workflow</a><a href="#parallel">Parallel verification</a><a href="#mask">Causal mask</a><a href="#accept">Acceptance</a><a href="#speed">Speedup</a><a href="#quiz">Quick quiz</a>
+</nav>
+
+<div class="callout green"><strong>One-sentence answer:</strong> The draft model proposes a short sequence autoregressively. The large teacher/target model then processes the prompt plus all proposed tokens in one Transformer forward pass, producing a next-token distribution at every position in parallel. A causal attention mask ensures each position only uses its own prefix.</div>
+
+<section id="big-picture">
+<h2>1. The big picture: two different jobs</h2>
+<p>In ordinary decoding, a model predicts one token, appends it to the context, and runs another decoding step. Speculative decoding divides the work between two models:</p>
+<div class="compare">
+<div><span class="pill">Draft model</span><h3>Proposes</h3><p>A smaller, faster model guesses several upcoming tokens. It still generates them one by one because each guess becomes context for the next guess.</p><div class="tokens"><span class="token draft">sat</span><span class="token draft">on</span><span class="token draft">the</span><span class="token draft">mat</span></div><p class="muted small">Four proposals require sequential draft steps.</p></div>
+<div><span class="pill">Target / teacher model</span><h3>Verifies</h3><p>The larger model evaluates the proposed sequence in one forward pass. It calculates the distribution for the next token at each proposed position.</p><div class="tokens"><span class="token accept">sat</span><span class="token accept">on</span><span class="token accept">the</span><span class="token accept">mat</span></div><p class="muted small">One target-model pass can check several proposals.</p></div>
+</div>
+<p class="muted small">“Teacher” is often used informally here; “target model” is the more general term. The target model defines the distribution we want to preserve.</p>
+</section>
+
+<section id="workflow">
+<h2>2. Walk through one speculative step</h2>
+<p>Suppose the current context is <code>The cat</code> and the draft model proposes four tokens. Click through the stages.</p>
+<div class="flow">
+<div class="step"><strong>① Current context</strong><div class="tokens"><span class="token">The</span><span class="token">cat</span></div><p class="muted small">Tokens already in the prompt.</p></div><div class="arrow">→</div>
+<div class="step"><strong>② Draft proposals</strong><div class="tokens"><span class="token draft">sat</span><span class="token draft">on</span><span class="token draft">the</span><span class="token draft">mat</span></div><p class="muted small">Drafted sequentially.</p></div><div class="arrow">→</div>
+<div class="step"><strong>③ Target verification</strong><p>One forward pass evaluates all proposed positions.</p><p class="muted small">Accept a prefix, then correct if needed.</p></div>
+</div>
+<div class="controls"><button id="prevStage" class="secondary">← Previous</button><button id="nextStage">Next stage →</button><button id="resetStage" class="secondary">Reset</button></div>
+<div id="stageStatus" class="status" aria-live="polite">Stage 1 of 3: Start with the known context, “The cat”.</div>
+</section>
+
+<section id="parallel">
+<h2>3. Why can the target model evaluate multiple positions at once?</h2>
+<p>A Transformer layer processes a sequence as a collection of position representations. During a forward pass, matrix operations for many positions can be performed together on the GPU. The model does not have to wait for the target model to generate each proposed token, because the draft has already supplied those token IDs.</p>
+<p>For the sequence <code>The cat sat on the mat</code>, the target model can calculate all of these next-token distributions in the same pass:</p>
+<div class="formula">P(sat | The cat)<br>P(on | The cat sat)<br>P(the | The cat sat on)<br>P(mat | The cat sat on the)</div>
+<p>Each expression is a different prediction position. The input sequence is known, so the target model can calculate hidden states and logits at all positions together.</p>
+<div class="callout orange"><strong>Important distinction:</strong> Parallel evaluation does not mean the target model magically knows the future. It is conditioning on the draft's proposed future tokens. If a proposal is wrong, later predictions conditioned on that proposal may not describe the sequence the target would have generated on its own. The acceptance/correction algorithm handles this.</div>
+<h3>What happens inside a forward pass?</h3>
+<ol>
+<li>The prompt and draft tokens are supplied as one token sequence.</li>
+<li>Embedding and Transformer layers process the sequence positions together.</li>
+<li>At each position, the model produces logits (scores for possible next tokens).</li>
+<li>Those logits are converted to probability distributions and used to verify the draft proposals.</li>
+</ol>
+</section>
+
+<section id="mask">
+<h2>4. The causal attention mask: no looking into the future</h2>
+<p>Autoregressive Transformers use causal attention. A position may attend to earlier tokens and itself, but not later positions. The model can still compute every row of this attention pattern in parallel.</p>
+<p>In this simplified diagram, columns are proposed tokens and rows show which of those token positions are visible to each row. ✓ means visible; — means blocked. The prompt tokens before these columns are also visible to every row.</p>
+<table class="matrix">
+<thead><tr><th>Query position</th><th>sat</th><th>on</th><th>the</th><th>mat</th></tr></thead>
+<tbody>
+<tr><th>sat</th><td class="yes">✓</td><td class="no">—</td><td class="no">—</td><td class="no">—</td></tr>
+<tr><th>on</th><td class="yes">✓</td><td class="yes">✓</td><td class="no">—</td><td class="no">—</td></tr>
+<tr><th>the</th><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">—</td></tr>
+<tr><th>mat</th><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+</tbody></table>
+<p class="muted small">The diagonal ✓ means a position can use its own token representation to compute the hidden state that predicts the following token. The actual mask also includes all preceding prompt positions.</p>
+<details><summary>Why is this not a contradiction?</summary><p>“Causal” describes which information each position may use—not the order in which the hardware must calculate every position. Since the input token IDs are already present, the model can calculate all permitted attention operations in parallel without allowing future-to-past information flow.</p></details>
+</section>
+
+<section id="accept">
+<h2>5. What does “verify” mean?</h2>
+<p>Verification is not simply checking whether a proposed token is the target model’s single most likely token. Standard speculative sampling uses a probability-based acceptance rule so the overall output distribution matches the target model’s distribution.</p>
+<ul>
+<li><strong>Accepted prefix:</strong> A run of draft tokens can be accepted from the start of the proposed block.</li>
+<li><strong>Rejection:</strong> If a proposal fails the sampling acceptance test, the algorithm samples a correction token from a distribution designed to preserve the target model’s distribution.</li>
+<li><strong>Bonus token:</strong> If every draft token is accepted, the target model can often sample one more token from the distribution after the final proposal.</li>
+</ul>
+<div class="callout"><strong>Do not confuse two ideas:</strong> the target model computes all the needed distributions in parallel, but the algorithm’s acceptance process still determines how many tokens from the proposed prefix can be committed.</div>
+<details><summary>Is it enough to compare draft and target top-1 tokens?</summary><p>No. Matching top-1 tokens is a useful intuition for a simplified explanation, but it is not the full standard algorithm. Exact speculative sampling uses the draft and target probability distributions, random acceptance decisions, and a correction distribution on rejection.</p></details>
+</section>
+
+<section id="speed">
+<h2>6. Why can this be faster?</h2>
+<div class="compare">
+<div><h3>Ordinary target decoding</h3><p>Target predicts one token → next target step → next target step…</p><div class="bar"><span style="width:25%"></span></div><p class="muted small">Many sequential target-model invocations.</p></div>
+<div><h3>Speculative decoding</h3><p>Draft proposes a block → target verifies the block in one pass.</p><div class="bar"><span style="width:85%"></span></div><p class="muted small">Fewer sequential target-model invocations when acceptance is good.</p></div>
+</div>
+<p>Large-model decoding can be limited by memory bandwidth and the overhead of repeatedly launching small inference steps. Processing several positions in one target pass can use the GPU more efficiently and reduce the number of sequential target calls.</p>
+<p>However, speculative decoding is not guaranteed to be faster. Performance depends on draft-model cost, how many proposals are accepted, sequence length, batching, hardware, and implementation details.</p>
+<div class="callout green"><strong>Takeaway:</strong> The draft model pays the sequential cost of guessing. The target model pays for a parallel verification pass. The method is useful when that verification pass costs less than generating the same number of tokens one at a time.</div>
+</section>
+
+<section id="quiz">
+<h2>7. Quick understanding check</h2>
+<p><strong>Question:</strong> Why can the target model evaluate four proposed tokens in one forward pass?</p>
+<button class="quiz-option" data-correct="false">A. It predicts the first token, then secretly uses that result to generate the next three sequentially in the same pass.</button>
+<button class="quiz-option" data-correct="true">B. The draft has already supplied the token IDs, so the target can compute predictions at all sequence positions together, using causal attention.</button>
+<button class="quiz-option" data-correct="false">C. The causal mask is disabled during verification, allowing every token to see the entire future.</button>
+<div id="quizFeedback" aria-live="polite"></div>
+</section>
+
+<section>
+<h2>8. Final mental model</h2>
+<ol>
+<li><strong>Unknown tokens must be generated autoregressively:</strong> the draft model proposes them one at a time.</li>
+<li><strong>Known proposed tokens can be evaluated in parallel:</strong> the target runs one forward pass over the whole proposed block.</li>
+<li><strong>Causality is preserved:</strong> the causal mask prevents each position from using later tokens.</li>
+<li><strong>Sampling correctness is preserved:</strong> acceptance and correction rules keep the output distribution aligned with the target model.</li>
+</ol>
+<p><strong>Remember:</strong> “parallel verification” means parallel computation of next-token distributions for a known proposed sequence—not parallel generation of arbitrary future text.</p>
+</section>
+</main>
+<footer>Self-contained lesson · Works offline · Includes interactive walkthrough and quiz</footer>
+<script>
+const stages=[
+'Stage 1 of 3: Start with the known context, “The cat”. No future tokens have been proposed yet.',
+'Stage 2 of 3: The draft model proposes “sat → on → the → mat” sequentially. Each draft prediction uses the context plus earlier draft proposals.',
+'Stage 3 of 3: The target model receives the prompt plus all four proposed tokens. One forward pass computes predictions at the proposed positions; the sampling rule determines the accepted prefix and any correction.'
+];
+let stage=0;
+const status=document.getElementById('stageStatus');
+function showStage(){status.textContent=stages[stage];document.getElementById('prevStage').disabled=stage===0;document.getElementById('nextStage').disabled=stage===2;}
+document.getElementById('prevStage').addEventListener('click',()=>{stage=Math.max(0,stage-1);showStage()});
+document.getElementById('nextStage').addEventListener('click',()=>{stage=Math.min(2,stage+1);showStage()});
+document.getElementById('resetStage').addEventListener('click',()=>{stage=0;showStage()});
+showStage();
+document.querySelectorAll('.quiz-option').forEach(btn=>btn.addEventListener('click',()=>{
+ const feedback=document.getElementById('quizFeedback');
+ if(btn.dataset.correct==='true'){feedback.textContent='Correct! The token IDs are already known from the draft, so the target can process all positions in one causal forward pass.';feedback.style.color='var(--green)';}
+ else{feedback.textContent='Not quite. The target does not sequentially generate the proposed block, and the causal mask is not disabled. Try option B.';feedback.style.color='var(--orange)';}
+}));
+</script>
+</body>
+</html>
